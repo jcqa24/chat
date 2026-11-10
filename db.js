@@ -2,12 +2,23 @@ const mysql = require('mysql2/promise');
 
 let pool;
 
+// Primera variable con valor. Además de DB_* acepta las que crea el MySQL de Railway (MYSQLHOST, etc.).
+const env = (...nombres) => nombres.map((n) => process.env[n]).find((v) => v !== undefined && v !== '');
+
+const config = {
+  host: env('DB_HOST', 'MYSQLHOST') || '127.0.0.1',
+  port: Number(env('DB_PORT', 'MYSQLPORT') || 3306),
+  user: env('DB_USER', 'MYSQLUSER') || 'root',
+  password: env('DB_PASSWORD', 'MYSQLPASSWORD', 'MYSQL_ROOT_PASSWORD') || '',
+  database: env('DB_NAME', 'MYSQLDATABASE', 'MYSQL_DATABASE') || 'chat_app',
+};
+
 function connectionOptions() {
   return {
-    host: process.env.DB_HOST || '127.0.0.1',
-    port: Number(process.env.DB_PORT || 3306),
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
+    host: config.host,
+    port: config.port,
+    user: config.user,
+    password: config.password,
     charset: 'utf8mb4',
   };
 }
@@ -66,7 +77,7 @@ async function columnExists(table, column) {
 }
 
 async function init() {
-  const dbName = process.env.DB_NAME || 'chat_app';
+  const dbName = config.database;
   if (!/^\w+$/.test(dbName)) throw new Error('DB_NAME inválido');
 
   const conn = await mysql.createConnection(connectionOptions());
@@ -431,6 +442,7 @@ async function recordPayment(p) {
 }
 
 module.exports = {
+  config,
   init,
   getActiveInfluencer,
   getInfluencers,

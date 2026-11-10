@@ -502,6 +502,6 @@ db.init()
     // Los errores de conexión de mysql2 a veces llegan sin mensaje, solo con código (p. ej. ECONNREFUSED)
     const causa = err.errors?.[0] ?? err;
     console.error(`${causa.code ?? 'ERROR'}: ${causa.message || err.message || 'sin detalle'}`);
-    console.error(`Conectando a ${process.env.DB_HOST || '127.0.0.1'}:${process.env.DB_PORT || 3306} como ${process.env.DB_USER || 'root'}`);
+    console.error(`Conectando a ${db.config.host}:${db.config.port} como ${db.config.user}, base "${db.config.database}"`);
     process.exit(1);
   });
