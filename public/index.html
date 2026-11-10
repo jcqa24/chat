@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Chat</title>
+  <script>
+    // Tema según la red del link (/IG..., /FB..., /TT...), antes de pintar para evitar parpadeo
+    (function () {
+      var net = (location.pathname.split('/')[1] || '').slice(0, 2);
+      var themes = { IG: 'instagram', FB: 'facebook', TT: 'tiktok' };
+      document.documentElement.setAttribute('data-theme', themes[net] || 'instagram');
+    })();
+  </script>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- Cabecera -->
+    <header class="header">
+      <div class="contact">
+        <img id="contactAvatar" class="avatar-lg" alt="" />
+        <div class="contact-info">
+          <div class="contact-name">
+            <span id="contactName">…</span>
+            <svg id="verifiedBadge" class="verified" hidden viewBox="0 0 40 40" aria-label="Verificado">
+              <path fill="#0095f6" d="M19.998 3.094 14.638 0l-2.972 5.15H5.432v6.354L0 14.64 3.094 20 0 25.359l5.432 3.137v5.905h5.975L14.638 40l5.36-3.094L25.358 40l3.232-5.6h6.162v-6.01L40 25.359 36.905 20 40 14.641l-5.248-3.03v-6.46h-6.419L25.358 0l-5.36 3.094Zm7.415 11.225 2.254 2.287-11.43 11.5-6.835-6.93 2.244-2.258 4.587 4.581 9.18-9.18Z"/>
+            </svg>
+          </div>
+          <div id="contactStatus" class="contact-status">Activo recientemente</div>
+        </div>
+      </div>
+      <div class="header-actions">
+        <button class="icon-btn" title="Más opciones" type="button">
+          <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Mensajes -->
+    <main id="messages" class="messages" aria-live="polite"></main>
+
+    <!-- Barra de escritura -->
+    <form id="composer" class="composer" autocomplete="off">
+      <input id="textInput" class="text-input" type="text" placeholder="Mensaje..." aria-label="Mensaje" maxlength="2000" />
+
+      <div class="composer-actions">
+        <button id="emojiBtn" class="icon-btn" type="button" title="Emoji">
+          <svg viewBox="0 0 24 24"><path d="M15.83 10.997a1.167 1.167 0 1 0 1.167 1.167 1.167 1.167 0 0 0-1.167-1.167Zm-6.5 1.167a1.167 1.167 0 1 0-1.166 1.167 1.167 1.167 0 0 0 1.166-1.167Zm5.163 3.24a3.406 3.406 0 0 1-4.982.007 1 1 0 1 0-1.557 1.256 5.397 5.397 0 0 0 8.09 0 1 1 0 0 0-1.55-1.263ZM12 .503a11.5 11.5 0 1 0 11.5 11.5A11.513 11.513 0 0 0 12 .503Zm0 21a9.5 9.5 0 1 1 9.5-9.5 9.51 9.51 0 0 1-9.5 9.5Z"/></svg>
+        </button>
+        <label class="icon-btn when-empty" title="Enviar foto" aria-label="Enviar foto">
+          <svg viewBox="0 0 24 24"><path d="M6.549 5.013A1.557 1.557 0 1 0 8.106 6.57a1.557 1.557 0 0 0-1.557-1.557Z" fill-rule="evenodd"/><path d="m2 18.605 3.901-3.9a.908.908 0 0 1 1.284 0l2.807 2.806a.908.908 0 0 0 1.283 0l5.534-5.534a.908.908 0 0 1 1.283 0l3.905 3.905" fill="none" stroke="currentColor" stroke-linejoin="round" stroke-width="2"/><path d="M18.44 2.004A3.56 3.56 0 0 1 22 5.564h0v12.873a3.56 3.56 0 0 1-3.56 3.56H5.568a3.56 3.56 0 0 1-3.56-3.56V5.563a3.56 3.56 0 0 1 3.56-3.56Z" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"/></svg>
+          <input id="photoInput" type="file" accept="image/jpeg,image/png,image/gif,image/webp" hidden />
+        </label>
+        <button id="sendBtn" class="send-btn" type="submit" title="Enviar" aria-label="Enviar mensaje" disabled>
+          <svg viewBox="0 0 24 24"><path d="M3.4 20.4 20.85 12.92a1 1 0 0 0 0-1.84L3.4 3.6a.99.99 0 0 0-1.39.91L2 9.12c0 .5.37.93.87.99L17 12 2.87 13.88c-.5.07-.87.5-.87 1l.01 4.61c0 .71.73 1.2 1.39.91Z"/></svg>
+        </button>
+      </div>
+
+      <div id="emojiPanel" class="emoji-panel" hidden></div>
+    </form>
+  </div>
+
+  <!-- Visor de fotos -->
+  <div id="lightbox" class="lightbox" hidden>
+    <button class="lightbox-close" type="button" aria-label="Cerrar">&times;</button>
+    <img id="lightboxImg" alt="Foto" />
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
