@@ -1,0 +1,15 @@
+# No se copian a la imagen
+node_modules
+npm-debug.log
+.env
+.env.*
+!.env.example
+uploads
+.git
+.gitignore
+.vscode
+Dockerfile
+.dockerignore
+iniciar-demo.bat
+n8n
+*.md
