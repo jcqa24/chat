@@ -3,7 +3,7 @@
 // Catálogos tomados de SIGEV (cat_tramite, cat_entidad, cat_tipovehiculo, cat_tiposervicio,
 // cat_vigencia, cat_modelo). Si SIGEV agrega trámites o estados, hay que agregarlos aquí.
 
-const SIGEV_URL = 'https://TU-SIGEV.com'; // ← URL de SIGEV, sin "/" al final
+const SIGEV_URL = 'https://my.grupogevhe.com'; // ← URL de SIGEV, sin "/" al final
 
 const entrada = $input.first().json;
 
@@ -51,6 +51,30 @@ const TRAMITES = {
   MUNDIAL: 45, 'PLACAS EDICION ESPECIAL': 45,
   'CONSTANCIA EXT': 46, 'CONSTANCIA DE EXTRAVIO': 46,
 };
+// El agente puede escribir el trámite de muchas formas ("reimpresión de tarjeta de circulación",
+// "reimprimir mi tarjeta", "perdí la tarjeta"...). Primero se busca exacto y luego por palabras clave.
+const PALABRAS_RELLENO = /\b(DE|DEL|LA|EL|LOS|LAS|MI|SU|UNA|UN|PARA|CIRCULACION|VEHICULAR|TRAMITE)\b/g;
+const REGLAS_TRAMITE = [
+  [/REIMPR/, /TARJETA/, 40],
+  [/REPOSIC|PERDI|EXTRAVI|ROBAR|ROBO/, /TARJETA/, 11],
+  [/RENOV|VENCID|ACTUALIZ/, /TARJETA/, 9],
+  [/REPOSIC|PERDI|EXTRAVI/, /LICENCIA/, 30],
+  [/PERMISO/, /SIN PLACA/, 20],
+  [/BAJA/, /ALTA/, 4],
+  [/CAMBIO/, /PROPIETARI|DUENO|NOMBRE/, 10],
+];
+const buscarTramite = (valor) => {
+  const v = norm(valor);
+  if (!v) return null;
+  if (TRAMITES[v]) return TRAMITES[v];
+  const corto = v.replace(PALABRAS_RELLENO, ' ').replace(/\s+/g, ' ').trim();
+  if (TRAMITES[corto]) return TRAMITES[corto];
+  for (const [a, b, id] of REGLAS_TRAMITE) if (a.test(v) && b.test(v)) return id;
+  const conDe = Object.keys(TRAMITES).find((k) => k.length > 5 && norm(k.replace(/ DE /g, ' ')) === corto);
+  return conDe ? TRAMITES[conDe] : null;
+};
+const NOMBRES_TRAMITE = Object.keys(TRAMITES).filter((k) => k.includes(' ') || k.length > 7).join(', ');
+
 const TRAMITES_CON_VIGENCIA = [18, 43, 44];
 const TRAMITE_VERIFICACION = 17;
 
@@ -111,19 +135,22 @@ const esVerdadero = (v) => v === true || ['TRUE', 'SI', '1', 'VOLUNTARIA'].inclu
 
 // ---------------------------------------------------------------------------
 const faltan = [];
-const idTramite = TRAMITES[norm(entrada.tramite)];
+const idTramite = buscarTramite(entrada.tramite);
 const idEntidad = buscarEstado(entrada.estado);
 const idVehiculo = VEHICULOS[norm(entrada.vehiculo)];
 const idServicio = SERVICIOS[norm(entrada.servicio)];
 
-if (!idTramite) faltan.push(`trámite (no reconozco "${entrada.tramite ?? ''}")`);
+if (!idTramite) faltan.push(`trámite (no reconozco "${entrada.tramite ?? ''}"; usa uno de: ${NOMBRES_TRAMITE})`);
 if (!idEntidad) faltan.push(`estado (no reconozco "${entrada.estado ?? ''}")`);
 if (!idVehiculo) faltan.push(`tipo de vehículo (no reconozco "${entrada.vehiculo ?? ''}")`);
-if (!idServicio) faltan.push(`servicio VIP, XP o CL (no reconozco "${entrada.servicio ?? ''}")`);
+// El servicio es opcional: si el cliente no lo dijo, "Respuesta para el agente" consulta VIP, XP y CL.
+const servicioIndicado = Boolean(idServicio);
+if (!servicioIndicado && norm(entrada.servicio)) faltan.push(`servicio VIP, XP o CL (no reconozco "${entrada.servicio}")`);
 
-const body = { id_tramite: idTramite, id_tipovehiculo: idVehiculo, id_entidad: idEntidad, id_tiposervicio: idServicio };
+const body = { id_tramite: idTramite, id_tipovehiculo: idVehiculo, id_entidad: idEntidad, id_tiposervicio: idServicio || 1 };
 const resumen = {
-  tramite: entrada.tramite, estado: entrada.estado, vehiculo: entrada.vehiculo, servicio: entrada.servicio,
+  tramite: entrada.tramite, estado: entrada.estado, vehiculo: entrada.vehiculo,
+  servicio: servicioIndicado ? entrada.servicio : 'sin indicar', servicioIndicado,
 };
 
 if (TRAMITES_CON_VIGENCIA.includes(idTramite)) {

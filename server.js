@@ -18,6 +18,11 @@ const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
 const N8N_WEBHOOK_SECRET = process.env.N8N_WEBHOOK_SECRET || '';
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
 const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET || '';
+// CRM (leadsgg): ahí se crea el lead cuando el cliente acepta continuar el trámite
+const CRM_URL = (process.env.CRM_URL || '').replace(/\/+$/, '');
+const CRM_API_TOKEN = process.env.CRM_API_TOKEN || '';
+const APP_ANDROID_URL = process.env.APP_ANDROID_URL || 'https://play.google.com/store/apps/details?id=com.grupogevhe.app&hl=es_MX';
+const APP_IOS_URL = process.env.APP_IOS_URL || 'https://apps.apple.com/mx/app/gevhe-app/id6759180407';
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
@@ -262,6 +267,64 @@ app.get('/api/conversations/:conversationId/messages', requireApiKey, async (req
     messages: messages.map(toApi),
   });
 });
+
+// Registrar al cliente cuando acepta continuar el trámite: guarda su nombre, le da un código
+// para la app y crea el lead en el CRM (tablero Comercial, primera columna) con el influencer de origen.
+app.post('/api/conversations/:conversationId/registro', requireApiKey, async (req, res) => {
+  const conversation = await findConversation(req.params.conversationId);
+  if (!conversation) return res.status(404).json({ error: 'Conversación no encontrada' });
+
+  const nombre = String(req.body?.nombre ?? '').replace(/\s+/g, ' ').trim();
+  if (nombre.length < 2 || nombre.length > 100) {
+    return res.status(400).json({ error: 'nombre es obligatorio (2 a 100 caracteres)' });
+  }
+
+  const result = await db.registerLead(conversation.id, nombre);
+  if (!result) return res.status(404).json({ error: 'Conversación no encontrada' });
+  const conv = result.conversation;
+
+  let crm = { sincronizado: Boolean(conv.crm_lead_id), leadId: conv.crm_lead_id ?? null };
+  if (!conv.crm_lead_id && CRM_URL && CRM_API_TOKEN) {
+    crm = await crearLeadEnCrm(conv, nombre);
+    if (crm.leadId) await db.setCrmLeadId(conv.id, crm.leadId);
+  }
+
+  res.status(result.created ? 201 : 200).json({
+    ok: true,
+    codigo: conv.app_code,
+    nuevo: result.created,
+    app: { android: APP_ANDROID_URL, iphone: APP_IOS_URL },
+    crm,
+  });
+});
+
+async function crearLeadEnCrm(conv, nombre) {
+  const influencer = await db.getInfluencer(conv.influencer_id);
+  try {
+    const resp = await fetch(`${CRM_URL}/api/lead/influencer`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${CRM_API_TOKEN}`, Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversacion_id: conv.id,
+        nombre,
+        codigo_app: conv.app_code,
+        influencer_id: conv.influencer_id,
+        influencer_nombre: influencer?.name ?? null,
+        origen: conv.referral_valid ? conv.source : null,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.lead_id) {
+      console.error(`CRM: no se creó el lead de la conversación ${conv.id} (${resp.status}): ${data.message ?? 'sin detalle'}`);
+      return { sincronizado: false, leadId: null };
+    }
+    return { sincronizado: true, leadId: data.lead_id };
+  } catch (err) {
+    console.error(`CRM: no se pudo conectar para la conversación ${conv.id}: ${err.message}`);
+    return { sincronizado: false, leadId: null };
+  }
+}
 
 // ---------- Links de referido (para el CRM) ----------
 

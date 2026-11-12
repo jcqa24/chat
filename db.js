@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 
 let pool;
@@ -133,8 +134,13 @@ async function init() {
       payment_id              VARCHAR(64)   NULL,
       payment_amount          DECIMAL(12,2) NULL,
       payment_currency        CHAR(3)       NULL,
+      lead_name               VARCHAR(100)  NULL,
+      app_code                VARCHAR(12)   NULL,
+      app_code_at             DATETIME(3)   NULL,
+      crm_lead_id             INT           NULL,
       created_at              DATETIME(3)   NOT NULL,
       UNIQUE KEY uq_conv_influencer_client (influencer_id, client_id),
+      UNIQUE KEY uq_conv_app_code (app_code),
       KEY idx_conv_influencer_created (influencer_id, created_at),
       KEY idx_conv_influencer_status (influencer_id, referral_status),
       CONSTRAINT fk_conv_influencer FOREIGN KEY (influencer_id) REFERENCES influencers(id),
@@ -147,11 +153,23 @@ async function init() {
     detected_platform: 'VARCHAR(16) NULL AFTER source',
     referral_valid: 'TINYINT(1) NOT NULL DEFAULT 1 AFTER detected_platform',
     user_agent: 'VARCHAR(500) NULL AFTER referral_valid',
+    // Registro del cliente cuando acepta continuar el trámite
+    lead_name: 'VARCHAR(100) NULL AFTER payment_currency',
+    app_code: 'VARCHAR(12) NULL AFTER lead_name',
+    app_code_at: 'DATETIME(3) NULL AFTER app_code',
+    crm_lead_id: 'INT NULL AFTER app_code_at',
   };
   for (const [col, def] of Object.entries(sourceColumns)) {
     if (!(await columnExists('conversations_influencers', col))) {
       await pool.query(`ALTER TABLE conversations_influencers ADD COLUMN ${col} ${def}`);
     }
+  }
+  const [[codeIndex]] = await pool.query(
+    `SELECT 1 AS ok FROM information_schema.STATISTICS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'conversations_influencers' AND INDEX_NAME = 'uq_conv_app_code' LIMIT 1`
+  );
+  if (!codeIndex) {
+    await pool.query('ALTER TABLE conversations_influencers ADD UNIQUE KEY uq_conv_app_code (app_code)');
   }
 
   await pool.query(`
@@ -441,6 +459,55 @@ async function recordPayment(p) {
   }
 }
 
+// ---------- Registro del cliente (código para la app) ----------
+// Sin 0/O, 1/I/L: el cliente lo copia a mano en la app.
+const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+const newAppCode = () =>
+  'GV' + Array.from({ length: 6 }, () => CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)]).join('');
+
+/**
+ * Guarda el nombre del cliente y le asigna un código para la app.
+ * Si la conversación ya tiene código, devuelve el mismo (n8n puede llamar varias veces).
+ */
+async function registerLead(conversationId, name) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [[row]] = await conn.query('SELECT * FROM conversations_influencers WHERE id = ? FOR UPDATE', [conversationId]);
+    if (!row) {
+      await conn.rollback();
+      return null;
+    }
+    let code = row.app_code;
+    let created = false;
+    if (!code) {
+      for (let intento = 0; intento < 5 && !code; intento++) {
+        const candidato = newAppCode();
+        const [[existe]] = await conn.query('SELECT 1 AS ok FROM conversations_influencers WHERE app_code = ?', [candidato]);
+        if (!existe) code = candidato;
+      }
+      if (!code) throw new Error('No se pudo generar un código único');
+      created = true;
+    }
+    await conn.query(
+      'UPDATE conversations_influencers SET lead_name = ?, app_code = ?, app_code_at = COALESCE(app_code_at, ?) WHERE id = ?',
+      [name, code, new Date(), conversationId]
+    );
+    await conn.commit();
+    const [[updated]] = await pool.query('SELECT * FROM conversations_influencers WHERE id = ?', [conversationId]);
+    return { conversation: updated, created };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+async function setCrmLeadId(conversationId, leadId) {
+  await pool.query('UPDATE conversations_influencers SET crm_lead_id = ? WHERE id = ?', [leadId, conversationId]);
+}
+
 module.exports = {
   config,
   init,
@@ -456,4 +523,6 @@ module.exports = {
   getMessages,
   insertMessage,
   recordPayment,
+  registerLead,
+  setCrmLeadId,
 };
