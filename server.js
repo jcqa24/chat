@@ -388,6 +388,34 @@ app.get('/api/conversations/:conversationId/precotizaciones', requireApiKey, asy
   res.json({ conversationId: conversation.id, precotizaciones: await db.getPrecotizaciones(conversation.id) });
 });
 
+// Todas las precotizaciones: ?influencer=<id|slug>&desde=YYYY-MM-DD&hasta=YYYY-MM-DD&limit=50&offset=0
+app.get('/api/precotizaciones', requireApiKey, async (req, res) => {
+  const fecha = (v) => (/^\d{4}-\d{2}-\d{2}( \d{2}:\d{2}(:\d{2})?)?$/.test(String(v ?? '')) ? String(v) : null);
+  for (const campo of ['desde', 'hasta']) {
+    if (req.query[campo] && !fecha(req.query[campo])) {
+      return res.status(400).json({ error: `${campo} debe tener formato YYYY-MM-DD` });
+    }
+  }
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 500);
+  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+  const resultado = await db.listPrecotizaciones({
+    influencer: req.query.influencer ? String(req.query.influencer) : null,
+    desde: fecha(req.query.desde),
+    hasta: fecha(req.query.hasta),
+    limit,
+    offset,
+  });
+  res.json({ ...resultado, limit, offset });
+});
+
+// Una precotización por su código (PRE0000001)
+app.get('/api/precotizaciones/:codigo', requireApiKey, async (req, res) => {
+  const codigo = String(req.params.codigo).trim().toUpperCase();
+  const precotizacion = await db.getPrecotizacionByCodigo(codigo);
+  if (!precotizacion) return res.status(404).json({ error: `No existe la precotización ${codigo}` });
+  res.json({ precotizacion });
+});
+
 async function crearLeadEnCrm(conv, nombre) {
   const influencer = await db.getInfluencer(conv.influencer_id);
   try {

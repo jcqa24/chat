@@ -593,6 +593,38 @@ async function getPrecotizaciones(conversationId) {
   return rows.map(toPrecotizacionDto);
 }
 
+// Con el influencer (slug y nombre) para los listados de la API
+const PRECOT_CON_INFLUENCER = `
+  SELECT p.*, i.slug AS influencer_slug, i.name AS influencer_name
+  FROM ent_precotizaciones p JOIN influencers i ON i.id = p.influencer_id`;
+const toPrecotizacionConInfluencer = (row) => ({
+  ...toPrecotizacionDto(row),
+  influencer: { id: row.influencer_id, slug: row.influencer_slug, name: row.influencer_name },
+});
+
+async function getPrecotizacionByCodigo(codigo) {
+  const [[row]] = await pool.query(`${PRECOT_CON_INFLUENCER} WHERE p.codigo = ?`, [codigo]);
+  return row ? toPrecotizacionConInfluencer(row) : null;
+}
+
+/** Todas las precotizaciones, más nuevas primero. Filtros opcionales: influencer (id o slug), desde, hasta (fechas). */
+async function listPrecotizaciones({ influencer, desde, hasta, limit = 50, offset = 0 } = {}) {
+  const where = [];
+  const params = [];
+  if (influencer) {
+    if (/^\d+$/.test(String(influencer))) { where.push('p.influencer_id = ?'); params.push(Number(influencer)); }
+    else { where.push('i.slug = ?'); params.push(String(influencer)); }
+  }
+  if (desde) { where.push('p.created_at >= ?'); params.push(desde); }
+  if (hasta) { where.push('p.created_at < ?'); params.push(hasta); }
+  const filtro = where.length ? ` WHERE ${where.join(' AND ')}` : '';
+  const [[{ total }]] = await pool.query(
+    `SELECT COUNT(*) AS total FROM ent_precotizaciones p JOIN influencers i ON i.id = p.influencer_id${filtro}`, params);
+  const [rows] = await pool.query(`${PRECOT_CON_INFLUENCER}${filtro} ORDER BY p.id DESC LIMIT ? OFFSET ?`,
+    [...params, limit, offset]);
+  return { total: Number(total), precotizaciones: rows.map(toPrecotizacionConInfluencer) };
+}
+
 module.exports = {
   config,
   init,
@@ -612,4 +644,6 @@ module.exports = {
   setCrmLeadId,
   createPrecotizacion,
   getPrecotizaciones,
+  getPrecotizacionByCodigo,
+  listPrecotizaciones,
 };
