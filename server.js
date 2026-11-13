@@ -346,14 +346,41 @@ app.post('/api/conversations/:conversationId/precotizaciones', requireApiKey, as
     masImpuestos: body.mas_impuestos === true || body.mas_impuestos === 'true' || body.mas_impuestos === 1,
   });
 
+  // Con enviar_mensaje, el servidor manda al chat el código y los links de la app (solo la primera vez):
+  // así el código nunca lo escribe el bot y siempre llega antes que el precio.
+  let mensajeEnviado = false;
+  if (created && (body.enviar_mensaje === true || body.enviar_mensaje === 'true')) {
+    await sendInfluencerMessage(conversation, mensajeCodigoApp(precotizacion.codigo));
+    mensajeEnviado = true;
+  }
+
   res.status(created ? 201 : 200).json({
     ok: true,
     codigo: precotizacion.codigo,
     nueva: created,
+    mensaje_enviado: mensajeEnviado,
     precotizacion,
     app: { android: APP_ANDROID_URL, iphone: APP_IOS_URL },
   });
 });
+
+const mensajeCodigoApp = (codigo) =>
+  `Tu código de seguimiento es: ${codigo} ✨\n` +
+  'Descarga la app de GEVHE e ingresa con él para continuar tu trámite 📲\n' +
+  `Android: ${APP_ANDROID_URL}\n` +
+  `iPhone: ${APP_IOS_URL}`;
+
+// Mensaje de la influencer generado por el servidor (no por n8n)
+async function sendInfluencerMessage(conversation, content) {
+  const msg = await db.insertMessage({ conversationId: conversation.id, sender: 'influencer', type: 'text', content });
+  const now = new Date();
+  await db.touchInfluencer(conversation.influencer_id, now);
+  io.to(room(conversation.id)).emit('message', msg);
+  io.to(room(conversation.id)).emit('presence', { lastSeen: now.toISOString() });
+  // Sandra sigue "escribiendo" el precio que n8n manda enseguida
+  io.to(room(conversation.id)).emit('typing', { typing: true });
+  return msg;
+}
 
 app.get('/api/conversations/:conversationId/precotizaciones', requireApiKey, async (req, res) => {
   const conversation = await findConversation(req.params.conversationId);
