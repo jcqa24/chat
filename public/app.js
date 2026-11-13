@@ -54,6 +54,27 @@
     return node;
   }
 
+  // Texto con las URLs (http/https) convertidas en links. Se arma con nodos, nunca con innerHTML.
+  const URL_RE = /https?:\/\/[^\s<>"']+/g;
+  const TRAILING_PUNCT_RE = /[.,;:!?)\]}¡¿]+$/; // "…id=123." → el punto no es parte del link
+  function linkify(node, text) {
+    let last = 0;
+    for (const match of text.matchAll(URL_RE)) {
+      let url = match[0];
+      const trailing = url.match(TRAILING_PUNCT_RE);
+      if (trailing) url = url.slice(0, -trailing[0].length);
+      if (match.index > last) node.append(text.slice(last, match.index));
+      const a = el('a', 'bubble-link', url);
+      a.href = url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      node.append(a);
+      last = match.index + url.length;
+    }
+    if (last < text.length) node.append(text.slice(last));
+    return node;
+  }
+
   function fmtTime(d) {
     let h = d.getHours();
     const ampm = h < 12 ? 'a.m.' : 'p.m.';
@@ -170,7 +191,7 @@
         bubble.append(img);
         bubble.addEventListener('click', () => openLightbox(m.content));
       } else {
-        bubble = el('div', 'bubble', m.content);
+        bubble = linkify(el('div', 'bubble'), m.content);
       }
       bubble.title = fmtTime(time);
       row.append(bubble);

@@ -135,6 +135,7 @@ button { font: inherit; color: inherit; }
   overflow-wrap: anywhere;
 }
 .row.mine .bubble { background: var(--bubble-mine); color: var(--bubble-mine-text); }
+.bubble-link { color: inherit; text-decoration: underline; text-underline-offset: 2px; font-weight: 600; }
 
 .photo {
   display: block;

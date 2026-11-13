@@ -37,6 +37,8 @@ const EXTERNAL_URL_RE = /^https?:\/\/\S+$/i;
 const CLIENT_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 const LINK_CODE_RE = /^[A-Za-z0-9]{8}$/;
 const INVALID_LINK = 'Este link no es válido o ya no está activo';
+const MESSAGE_SPLIT_RE = /\s*\[SEPARAR\]\s*/i; // separa una respuesta del bot en varios mensajes
+const SPLIT_DELAY_MS = 900;
 const EXTERNAL_REF_RE = /^chat-(\d+)$/; // external_reference que pone el CRM en Mercado Pago
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -222,23 +224,36 @@ app.post('/api/messages', requireApiKey, async (req, res) => {
   if (!conversation) return res.status(404).json({ error: 'Conversación no encontrada' });
 
   const type = body.type || 'text';
-  const norm = normalizeMessage(type, body.content, true);
-  if (norm.error) return res.status(400).json({ error: norm.error });
-
-  const msg = await db.insertMessage({
-    conversationId: conversation.id,
-    sender: 'influencer',
-    type,
-    content: norm.content,
-  });
-  const now = new Date();
-  await db.touchInfluencer(conversation.influencer_id, now);
+  // El bot puede mandar varios mensajes en una respuesta separándolos con [SEPARAR]
+  const partes = type === 'text' && typeof body.content === 'string'
+    ? body.content.split(MESSAGE_SPLIT_RE).map((p) => p.trim()).filter(Boolean).slice(0, 5)
+    : [body.content];
+  const normalizados = partes.map((p) => normalizeMessage(type, p, true));
+  const invalido = normalizados.find((n) => n.error);
+  if (invalido || !normalizados.length) return res.status(400).json({ error: invalido?.error || 'Mensaje vacío' });
 
   cancelAutoTyping(conversation.id); // si la respuesta llega antes de 1 s, no mostrar "Escribiendo..."
-  io.to(room(conversation.id)).emit('message', msg);
+  const enviados = [];
+  for (const [i, norm] of normalizados.entries()) {
+    if (i > 0) {
+      // Entre mensajes, un instante de "Escribiendo..." para que se lean como dos mensajes seguidos
+      io.to(room(conversation.id)).emit('typing', { typing: true });
+      await new Promise((r) => setTimeout(r, SPLIT_DELAY_MS));
+    }
+    const msg = await db.insertMessage({
+      conversationId: conversation.id,
+      sender: 'influencer',
+      type,
+      content: norm.content,
+    });
+    io.to(room(conversation.id)).emit('message', msg);
+    enviados.push(msg);
+  }
+  const now = new Date();
+  await db.touchInfluencer(conversation.influencer_id, now);
   io.to(room(conversation.id)).emit('presence', { lastSeen: now.toISOString() });
 
-  res.status(201).json({ ok: true, message: toApi(msg) });
+  res.status(201).json({ ok: true, message: toApi(enviados[0]), messages: enviados.map(toApi) });
 });
 
 // Mostrar / ocultar "Escribiendo..." de la influencer
