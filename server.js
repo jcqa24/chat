@@ -23,6 +23,10 @@ const CRM_URL = (process.env.CRM_URL || '').replace(/\/+$/, '');
 const CRM_API_TOKEN = process.env.CRM_API_TOKEN || '';
 const APP_ANDROID_URL = process.env.APP_ANDROID_URL || 'https://play.google.com/store/apps/details?id=com.grupogevhe.app&hl=es_MX';
 const APP_IOS_URL = process.env.APP_IOS_URL || 'https://apps.apple.com/mx/app/gevhe-app/id6759180407';
+// Primer mensaje de la influencer en cada conversación nueva. GREETING_MESSAGE=off lo desactiva.
+const GREETING_MESSAGE = ((g) => (g === 'off' ? '' : g))(
+  (process.env.GREETING_MESSAGE || '¡Hola! 👋 Qué gusto que me escribas. ¿En qué te puedo ayudar o qué trámite vas a realizar?').trim()
+);
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
@@ -470,6 +474,10 @@ io.use(async (socket, next) => {
     });
     if (created) {
       await db.insertMessage({ conversationId: conversation.id, sender: 'system', type: 'system', content: 'accepted' });
+      // La influencer saluda primero, sin esperar a que el cliente escriba
+      if (GREETING_MESSAGE) {
+        await db.insertMessage({ conversationId: conversation.id, sender: 'influencer', type: 'text', content: GREETING_MESSAGE });
+      }
     }
 
     socket.data.client = client;
