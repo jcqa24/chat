@@ -101,6 +101,29 @@ CREATE TABLE IF NOT EXISTS payments_influencers (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- =========================================================
+-- Precotizaciones que el cliente acepta en el chat.
+-- codigo = 'PRE' + id a 7 dígitos (PRE0000001, PRE0000002...); lo asigna el servidor al insertar.
+-- =========================================================
+CREATE TABLE IF NOT EXISTS ent_precotizaciones (
+  id              INT AUTO_INCREMENT PRIMARY KEY,
+  codigo          VARCHAR(12)   NULL COMMENT 'PRE + id a 7 dígitos; se asigna al insertar',
+  conversation_id INT           NOT NULL,
+  influencer_id   INT           NOT NULL,
+  tramite         VARCHAR(120)  NOT NULL,
+  estado          VARCHAR(60)   NULL,
+  vehiculo        VARCHAR(60)   NULL,
+  servicio        VARCHAR(20)   NULL,
+  costo           DECIMAL(12,2) NULL,
+  mas_impuestos   TINYINT(1)    NOT NULL DEFAULT 0,
+  created_at      DATETIME(3)   NOT NULL,
+  UNIQUE KEY uq_precot_codigo (codigo),
+  KEY idx_precot_conversation (conversation_id),
+  KEY idx_precot_influencer_created (influencer_id, created_at),
+  CONSTRAINT fk_precot_conversation FOREIGN KEY (conversation_id) REFERENCES conversations_influencers(id),
+  CONSTRAINT fk_precot_influencer   FOREIGN KEY (influencer_id)   REFERENCES influencers(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =========================================================
 -- Vistas de estadísticas (solo cuentan referidos válidos: referral_valid = 1)
 -- =========================================================
 CREATE OR REPLACE VIEW v_influencer_referral_stats AS

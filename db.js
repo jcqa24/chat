@@ -203,6 +203,27 @@ async function init() {
       CONSTRAINT fk_pay_conversation FOREIGN KEY (conversation_id) REFERENCES conversations_influencers(id)
     ) ${TABLE_OPTS}`);
 
+  // Precotizaciones que el cliente acepta en el chat (código PRE0000001, PRE0000002...)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ent_precotizaciones (
+      id              INT AUTO_INCREMENT PRIMARY KEY,
+      codigo          VARCHAR(12)   NULL COMMENT 'PRE + id a 7 dígitos; se asigna al insertar',
+      conversation_id INT           NOT NULL,
+      influencer_id   INT           NOT NULL,
+      tramite         VARCHAR(120)  NOT NULL,
+      estado          VARCHAR(60)   NULL,
+      vehiculo        VARCHAR(60)   NULL,
+      servicio        VARCHAR(20)   NULL,
+      costo           DECIMAL(12,2) NULL,
+      mas_impuestos   TINYINT(1)    NOT NULL DEFAULT 0,
+      created_at      DATETIME(3)   NOT NULL,
+      UNIQUE KEY uq_precot_codigo (codigo),
+      KEY idx_precot_conversation (conversation_id),
+      KEY idx_precot_influencer_created (influencer_id, created_at),
+      CONSTRAINT fk_precot_conversation FOREIGN KEY (conversation_id) REFERENCES conversations_influencers(id),
+      CONSTRAINT fk_precot_influencer   FOREIGN KEY (influencer_id)   REFERENCES influencers(id)
+    ) ${TABLE_OPTS}`);
+
   // Vistas de estadísticas para el CRM (solo cuentan referidos válidos)
   await pool.query(STATS_VIEW_SQL);
   await pool.query(STATS_BY_SOURCE_VIEW_SQL);
@@ -508,6 +529,70 @@ async function setCrmLeadId(conversationId, leadId) {
   await pool.query('UPDATE conversations_influencers SET crm_lead_id = ? WHERE id = ?', [leadId, conversationId]);
 }
 
+// ---------- Precotizaciones ----------
+const PRECOT_PREFIX = 'PRE';
+const precotCode = (id) => PRECOT_PREFIX + String(id).padStart(7, '0');
+
+function toPrecotizacionDto(row) {
+  return {
+    id: row.id,
+    codigo: row.codigo,
+    conversation_id: row.conversation_id,
+    influencer_id: row.influencer_id,
+    tramite: row.tramite,
+    estado: row.estado,
+    vehiculo: row.vehiculo,
+    servicio: row.servicio,
+    costo: row.costo === null ? null : Number(row.costo),
+    mas_impuestos: !!row.mas_impuestos,
+    created_at: iso(row.created_at),
+  };
+}
+
+/**
+ * Guarda la precotización que el cliente aceptó y le asigna su código (PRE0000001...).
+ * Si la misma conversación ya tiene una con los mismos datos, devuelve esa (n8n puede repetir la llamada).
+ */
+async function createPrecotizacion(conversation, datos) {
+  const campos = [datos.tramite, datos.estado, datos.vehiculo, datos.servicio, datos.costo];
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    // Bloquea la conversación: dos llamadas a la vez no crean dos precotizaciones iguales
+    await conn.query('SELECT id FROM conversations_influencers WHERE id = ? FOR UPDATE', [conversation.id]);
+    const [[existente]] = await conn.query(
+      `SELECT * FROM ent_precotizaciones
+       WHERE conversation_id = ? AND tramite <=> ? AND estado <=> ? AND vehiculo <=> ? AND servicio <=> ? AND costo <=> ?
+       ORDER BY id DESC LIMIT 1`,
+      [conversation.id, ...campos]
+    );
+    if (existente) {
+      await conn.commit();
+      return { precotizacion: toPrecotizacionDto(existente), created: false };
+    }
+    const [res] = await conn.query(
+      `INSERT INTO ent_precotizaciones
+         (conversation_id, influencer_id, tramite, estado, vehiculo, servicio, costo, mas_impuestos, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [conversation.id, conversation.influencer_id, ...campos, datos.masImpuestos ? 1 : 0, new Date()]
+    );
+    await conn.query('UPDATE ent_precotizaciones SET codigo = ? WHERE id = ?', [precotCode(res.insertId), res.insertId]);
+    const [[row]] = await conn.query('SELECT * FROM ent_precotizaciones WHERE id = ?', [res.insertId]);
+    await conn.commit();
+    return { precotizacion: toPrecotizacionDto(row), created: true };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+async function getPrecotizaciones(conversationId) {
+  const [rows] = await pool.query('SELECT * FROM ent_precotizaciones WHERE conversation_id = ? ORDER BY id', [conversationId]);
+  return rows.map(toPrecotizacionDto);
+}
+
 module.exports = {
   config,
   init,
@@ -525,4 +610,6 @@ module.exports = {
   recordPayment,
   registerLead,
   setCrmLeadId,
+  createPrecotizacion,
+  getPrecotizaciones,
 };

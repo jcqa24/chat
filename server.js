@@ -302,6 +302,50 @@ app.post('/api/conversations/:conversationId/registro', requireApiKey, async (re
   });
 });
 
+// Precotización aceptada: n8n la guarda cuando el cliente dice que sí quiere continuar
+// y recibe el código de seguimiento (PRE0000001) que Sandra le da junto con los links de la app.
+app.post('/api/conversations/:conversationId/precotizaciones', requireApiKey, async (req, res) => {
+  const conversation = await findConversation(req.params.conversationId);
+  if (!conversation) return res.status(404).json({ error: 'Conversación no encontrada' });
+
+  const body = req.body || {};
+  const texto = (v, max) => {
+    const s = String(v ?? '').replace(/\s+/g, ' ').trim();
+    return s ? s.slice(0, max) : null;
+  };
+  const tramite = texto(body.tramite, 120);
+  if (!tramite) return res.status(400).json({ error: 'tramite es obligatorio' });
+
+  let costo = null;
+  if (body.costo !== undefined && body.costo !== null && body.costo !== '') {
+    costo = Number(String(body.costo).replace(/[$,\s]/g, ''));
+    if (!Number.isFinite(costo) || costo < 0) return res.status(400).json({ error: 'costo no es un número válido' });
+  }
+
+  const { precotizacion, created } = await db.createPrecotizacion(conversation, {
+    tramite,
+    estado: texto(body.estado, 60),
+    vehiculo: texto(body.vehiculo, 60),
+    servicio: texto(body.servicio, 20),
+    costo,
+    masImpuestos: body.mas_impuestos === true || body.mas_impuestos === 'true' || body.mas_impuestos === 1,
+  });
+
+  res.status(created ? 201 : 200).json({
+    ok: true,
+    codigo: precotizacion.codigo,
+    nueva: created,
+    precotizacion,
+    app: { android: APP_ANDROID_URL, iphone: APP_IOS_URL },
+  });
+});
+
+app.get('/api/conversations/:conversationId/precotizaciones', requireApiKey, async (req, res) => {
+  const conversation = await findConversation(req.params.conversationId);
+  if (!conversation) return res.status(404).json({ error: 'Conversación no encontrada' });
+  res.json({ conversationId: conversation.id, precotizaciones: await db.getPrecotizaciones(conversation.id) });
+});
+
 async function crearLeadEnCrm(conv, nombre) {
   const influencer = await db.getInfluencer(conv.influencer_id);
   try {
