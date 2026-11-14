@@ -211,13 +211,14 @@ async function init() {
       conversation_id INT           NOT NULL,
       influencer_id   INT           NOT NULL,
       tramite         VARCHAR(120)  NOT NULL,
+      id_tramite      INT           NULL COMMENT 'id de cat_tramite en SIGEV',
+      nombre_tramite  VARCHAR(150)  NULL COMMENT 'Nombre del trámite en el catálogo de SIGEV (Licencia de manejo, Cambio de propietario)',
       estado          VARCHAR(60)   NULL,
       vehiculo        VARCHAR(60)   NULL,
       servicio        VARCHAR(20)   NULL,
       costo           DECIMAL(12,2) NULL,
       mas_impuestos   TINYINT(1)    NOT NULL DEFAULT 0,
       clave_tramite   VARCHAR(20)   NULL COMMENT 'Clave del trámite en SIGEV (A0064466) cuando el cliente lo ingresa',
-      nombre_tramite  VARCHAR(150)  NULL COMMENT 'Nombre del trámite ingresado en SIGEV (Licencia A1, Cambio de propietario)',
       tramite_at      DATETIME(3)   NULL COMMENT 'Cuándo se registró clave_tramite',
       created_at      DATETIME(3)   NOT NULL,
       UNIQUE KEY uq_precot_codigo (codigo),
@@ -236,7 +237,12 @@ async function init() {
   }
   if (!(await columnExists('ent_precotizaciones', 'nombre_tramite'))) {
     await pool.query(`ALTER TABLE ent_precotizaciones
-      ADD COLUMN nombre_tramite VARCHAR(150) NULL COMMENT 'Nombre del trámite ingresado en SIGEV (Licencia A1, Cambio de propietario)' AFTER clave_tramite`);
+      ADD COLUMN nombre_tramite VARCHAR(150) NULL COMMENT 'Nombre del trámite en el catálogo de SIGEV (Licencia de manejo, Cambio de propietario)' AFTER tramite`);
+  }
+  if (!(await columnExists('ent_precotizaciones', 'id_tramite'))) {
+    await pool.query(`ALTER TABLE ent_precotizaciones
+      ADD COLUMN id_tramite INT NULL COMMENT 'id de cat_tramite en SIGEV' AFTER tramite,
+      MODIFY COLUMN nombre_tramite VARCHAR(150) NULL COMMENT 'Nombre del trámite en el catálogo de SIGEV (Licencia de manejo, Cambio de propietario)' AFTER id_tramite`);
   }
 
   // Vistas de estadísticas para el CRM (solo cuentan referidos válidos)
@@ -555,13 +561,14 @@ function toPrecotizacionDto(row) {
     conversation_id: row.conversation_id,
     influencer_id: row.influencer_id,
     tramite: row.tramite,
+    id_tramite: row.id_tramite ?? null,
+    nombre_tramite: row.nombre_tramite ?? null,
     estado: row.estado,
     vehiculo: row.vehiculo,
     servicio: row.servicio,
     costo: row.costo === null ? null : Number(row.costo),
     mas_impuestos: !!row.mas_impuestos,
     clave_tramite: row.clave_tramite ?? null,
-    nombre_tramite: row.nombre_tramite ?? null,
     tramite_at: iso(row.tramite_at),
     created_at: iso(row.created_at),
   };
@@ -590,9 +597,11 @@ async function createPrecotizacion(conversation, datos) {
     }
     const [res] = await conn.query(
       `INSERT INTO ent_precotizaciones
-         (conversation_id, influencer_id, tramite, estado, vehiculo, servicio, costo, mas_impuestos, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [conversation.id, conversation.influencer_id, ...campos, datos.masImpuestos ? 1 : 0, new Date()]
+         (conversation_id, influencer_id, tramite, estado, vehiculo, servicio, costo, mas_impuestos,
+          id_tramite, nombre_tramite, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [conversation.id, conversation.influencer_id, ...campos, datos.masImpuestos ? 1 : 0,
+        datos.idTramite ?? null, datos.nombreTramite ?? null, new Date()]
     );
     await conn.query('UPDATE ent_precotizaciones SET codigo = ? WHERE id = ?', [precotCode(res.insertId), res.insertId]);
     const [[row]] = await conn.query('SELECT * FROM ent_precotizaciones WHERE id = ?', [res.insertId]);
@@ -626,17 +635,17 @@ async function getPrecotizacionByCodigo(codigo) {
 }
 
 /**
- * Liga la precotización con el trámite que se ingresó en SIGEV (clave A0064466 y nombre, p. ej. "Licencia A1").
+ * Liga la precotización con el trámite que se ingresó en SIGEV (clave A0064466).
  * Devuelve { precotizacion } o { error: 'no_existe' | 'clave_usada' }.
  */
-async function setClaveTramite(codigo, claveTramite, nombreTramite) {
+async function setClaveTramite(codigo, claveTramite) {
   try {
     const [res] = await pool.query(
       // tramite_at va primero: MySQL aplica el SET en orden y aquí aún ve la clave anterior
       `UPDATE ent_precotizaciones
-       SET tramite_at = COALESCE(IF(clave_tramite <=> ?, tramite_at, NULL), ?), clave_tramite = ?, nombre_tramite = ?
+       SET tramite_at = COALESCE(IF(clave_tramite <=> ?, tramite_at, NULL), ?), clave_tramite = ?
        WHERE codigo = ?`,
-      [claveTramite, new Date(), claveTramite, nombreTramite, codigo]
+      [claveTramite, new Date(), claveTramite, codigo]
     );
     if (!res.affectedRows) return { error: 'no_existe' };
   } catch (err) {

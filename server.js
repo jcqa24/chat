@@ -344,6 +344,9 @@ app.post('/api/conversations/:conversationId/precotizaciones', requireApiKey, as
     servicio: texto(body.servicio, 20),
     costo,
     masImpuestos: body.mas_impuestos === true || body.mas_impuestos === 'true' || body.mas_impuestos === 1,
+    // Nombre oficial del trámite en SIGEV (lo manda n8n): "Licencia de manejo", "Cambio de propietario"
+    idTramite: Number.isInteger(Number(body.id_tramite)) && Number(body.id_tramite) > 0 ? Number(body.id_tramite) : null,
+    nombreTramite: texto(body.nombre_tramite, 150),
   });
 
   // Con enviar_mensaje, el servidor manda al chat el código y los links de la app (solo la primera vez):
@@ -408,19 +411,15 @@ app.get('/api/precotizaciones', requireApiKey, async (req, res) => {
   res.json({ ...resultado, limit, offset });
 });
 
-// SIGEV/la app avisan que el cliente ya ingresó el trámite: liga PRE0000001 con la clave A0064466 y su nombre
-// Body: { clave_tramite: 'A0064466', nombre_tramite: 'Licencia A1' }
+// SIGEV/la app avisan que el cliente ya ingresó el trámite: liga PRE0000001 con la clave A0064466
+// Body: { clave_tramite: 'A0064466' }
 app.put('/api/precotizaciones/:codigo/tramite', requireApiKey, async (req, res) => {
   const codigo = String(req.params.codigo).trim().toUpperCase();
   const clave = String(req.body?.clave_tramite ?? '').trim().toUpperCase();
   if (!/^A[0-9A-Z]{1,19}$/.test(clave)) {
     return res.status(400).json({ error: 'clave_tramite es obligatoria y debe empezar con A (ej. A0064466)' });
   }
-  const nombre = String(req.body?.nombre_tramite ?? '').trim().replace(/\s+/g, ' ');
-  if (!nombre || nombre.length > 150) {
-    return res.status(400).json({ error: 'nombre_tramite es obligatorio (máx. 150 caracteres), ej. "Licencia A1"' });
-  }
-  const r = await db.setClaveTramite(codigo, clave, nombre);
+  const r = await db.setClaveTramite(codigo, clave);
   if (r.error === 'no_existe') return res.status(404).json({ error: `No existe la precotización ${codigo}` });
   if (r.error === 'clave_usada') return res.status(409).json({ error: `La clave ${clave} ya está ligada a otra precotización` });
   res.json({ ok: true, precotizacion: r.precotizacion });
