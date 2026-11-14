@@ -216,13 +216,28 @@ async function init() {
       servicio        VARCHAR(20)   NULL,
       costo           DECIMAL(12,2) NULL,
       mas_impuestos   TINYINT(1)    NOT NULL DEFAULT 0,
+      clave_tramite   VARCHAR(20)   NULL COMMENT 'Clave del trámite en SIGEV (A0064466) cuando el cliente lo ingresa',
+      nombre_tramite  VARCHAR(150)  NULL COMMENT 'Nombre del trámite ingresado en SIGEV (Licencia A1, Cambio de propietario)',
+      tramite_at      DATETIME(3)   NULL COMMENT 'Cuándo se registró clave_tramite',
       created_at      DATETIME(3)   NOT NULL,
       UNIQUE KEY uq_precot_codigo (codigo),
+      UNIQUE KEY uq_precot_clave_tramite (clave_tramite),
       KEY idx_precot_conversation (conversation_id),
       KEY idx_precot_influencer_created (influencer_id, created_at),
       CONSTRAINT fk_precot_conversation FOREIGN KEY (conversation_id) REFERENCES conversations_influencers(id),
       CONSTRAINT fk_precot_influencer   FOREIGN KEY (influencer_id)   REFERENCES influencers(id)
     ) ${TABLE_OPTS}`);
+  // Tablas creadas antes de que existiera clave_tramite
+  if (!(await columnExists('ent_precotizaciones', 'clave_tramite'))) {
+    await pool.query(`ALTER TABLE ent_precotizaciones
+      ADD COLUMN clave_tramite VARCHAR(20) NULL COMMENT 'Clave del trámite en SIGEV (A0064466) cuando el cliente lo ingresa' AFTER mas_impuestos,
+      ADD COLUMN tramite_at DATETIME(3) NULL COMMENT 'Cuándo se registró clave_tramite' AFTER clave_tramite,
+      ADD UNIQUE KEY uq_precot_clave_tramite (clave_tramite)`);
+  }
+  if (!(await columnExists('ent_precotizaciones', 'nombre_tramite'))) {
+    await pool.query(`ALTER TABLE ent_precotizaciones
+      ADD COLUMN nombre_tramite VARCHAR(150) NULL COMMENT 'Nombre del trámite ingresado en SIGEV (Licencia A1, Cambio de propietario)' AFTER clave_tramite`);
+  }
 
   // Vistas de estadísticas para el CRM (solo cuentan referidos válidos)
   await pool.query(STATS_VIEW_SQL);
@@ -545,6 +560,9 @@ function toPrecotizacionDto(row) {
     servicio: row.servicio,
     costo: row.costo === null ? null : Number(row.costo),
     mas_impuestos: !!row.mas_impuestos,
+    clave_tramite: row.clave_tramite ?? null,
+    nombre_tramite: row.nombre_tramite ?? null,
+    tramite_at: iso(row.tramite_at),
     created_at: iso(row.created_at),
   };
 }
@@ -607,6 +625,27 @@ async function getPrecotizacionByCodigo(codigo) {
   return row ? toPrecotizacionConInfluencer(row) : null;
 }
 
+/**
+ * Liga la precotización con el trámite que se ingresó en SIGEV (clave A0064466 y nombre, p. ej. "Licencia A1").
+ * Devuelve { precotizacion } o { error: 'no_existe' | 'clave_usada' }.
+ */
+async function setClaveTramite(codigo, claveTramite, nombreTramite) {
+  try {
+    const [res] = await pool.query(
+      // tramite_at va primero: MySQL aplica el SET en orden y aquí aún ve la clave anterior
+      `UPDATE ent_precotizaciones
+       SET tramite_at = COALESCE(IF(clave_tramite <=> ?, tramite_at, NULL), ?), clave_tramite = ?, nombre_tramite = ?
+       WHERE codigo = ?`,
+      [claveTramite, new Date(), claveTramite, nombreTramite, codigo]
+    );
+    if (!res.affectedRows) return { error: 'no_existe' };
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') return { error: 'clave_usada' };
+    throw err;
+  }
+  return { precotizacion: await getPrecotizacionByCodigo(codigo) };
+}
+
 /** Todas las precotizaciones, más nuevas primero. Filtros opcionales: influencer (id o slug), desde, hasta (fechas). */
 async function listPrecotizaciones({ influencer, desde, hasta, limit = 50, offset = 0 } = {}) {
   const where = [];
@@ -646,4 +685,5 @@ module.exports = {
   getPrecotizaciones,
   getPrecotizacionByCodigo,
   listPrecotizaciones,
+  setClaveTramite,
 };

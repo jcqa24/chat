@@ -408,6 +408,24 @@ app.get('/api/precotizaciones', requireApiKey, async (req, res) => {
   res.json({ ...resultado, limit, offset });
 });
 
+// SIGEV/la app avisan que el cliente ya ingresó el trámite: liga PRE0000001 con la clave A0064466 y su nombre
+// Body: { clave_tramite: 'A0064466', nombre_tramite: 'Licencia A1' }
+app.put('/api/precotizaciones/:codigo/tramite', requireApiKey, async (req, res) => {
+  const codigo = String(req.params.codigo).trim().toUpperCase();
+  const clave = String(req.body?.clave_tramite ?? '').trim().toUpperCase();
+  if (!/^A[0-9A-Z]{1,19}$/.test(clave)) {
+    return res.status(400).json({ error: 'clave_tramite es obligatoria y debe empezar con A (ej. A0064466)' });
+  }
+  const nombre = String(req.body?.nombre_tramite ?? '').trim().replace(/\s+/g, ' ');
+  if (!nombre || nombre.length > 150) {
+    return res.status(400).json({ error: 'nombre_tramite es obligatorio (máx. 150 caracteres), ej. "Licencia A1"' });
+  }
+  const r = await db.setClaveTramite(codigo, clave, nombre);
+  if (r.error === 'no_existe') return res.status(404).json({ error: `No existe la precotización ${codigo}` });
+  if (r.error === 'clave_usada') return res.status(409).json({ error: `La clave ${clave} ya está ligada a otra precotización` });
+  res.json({ ok: true, precotizacion: r.precotizacion });
+});
+
 // Una precotización por su código (PRE0000001)
 app.get('/api/precotizaciones/:codigo', requireApiKey, async (req, res) => {
   const codigo = String(req.params.codigo).trim().toUpperCase();
