@@ -137,6 +137,35 @@ button { font: inherit; color: inherit; }
 .row.mine .bubble { background: var(--bubble-mine); color: var(--bubble-mine-text); }
 .bubble-link { color: inherit; text-decoration: underline; text-underline-offset: 2px; font-weight: 600; }
 
+/* Código con botón de copiar ([copiar]PRE0000001[/copiar]) */
+.copy-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0;
+  padding: 3px 4px 3px 10px;
+  border-radius: 999px;
+  /* Tono del texto de la burbuja muy suave: funciona en burbujas oscuras y claras */
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.copy-chip__code { font: 700 0.95em/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.5px; }
+.copy-chip__btn {
+  border: 0;
+  border-radius: 999px;
+  padding: 4px 10px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 0.85em;
+  font-weight: 600;
+  cursor: pointer;
+}
+.copy-chip__btn:hover { background: var(--accent-hover); }
+.copy-chip__btn.is-done { background: #2e7d32; }
+.copy-chip__btn:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+
 .photo {
   display: block;
   padding: 0;

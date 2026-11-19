@@ -1,6 +1,10 @@
 // Código del nodo "Respuesta para el agente" del sub-workflow cotizar_tramite (n8n).
 // Recibe la respuesta completa de SIGEV /api/getCosto (Full Response) y la deja lista para el agente.
 // Si no hay precio con el servicio pedido, consulta los otros servicios (VIP, XP, CL) para ofrecérselos al cliente.
+//
+// Flujo: Sandra da el precio y pregunta "¿Te gustaría avanzar con eso?". El precio se registra en el chat
+// (POST /api/conversations/:id/cotizacion) para cuando el cliente responda con la herramienta
+// respuesta_cotizacion. Aquí ya NO se guarda la precotización ni se manda ningún código.
 
 // Qué incluye cada servicio (descripciones de cat_tiposervicio en SIGEV).
 const SERVICIOS = {
@@ -8,42 +12,55 @@ const SERVICIOS = {
   2: { clave: 'XP', descripcion: 'Servicio XP (pendiente de descripción).' }, // ← pon aquí qué incluye XP
   3: { clave: 'CL', descripcion: 'Para concluir el trámite tienes que acudir tú a la Delegación.' },
 };
+const ID_SERVICIO = { VIP: 1, XP: 2, CL: 3 };
 const DIFERENCIAS = Object.values(SERVICIOS).map((s) => `${s.clave}: ${s.descripcion}`).join(' | ');
 
-// Servidor del chat: cuando hay un precio definido se guarda la precotización y el servidor le manda al
-// cliente su código de seguimiento (PRE0000001) y los links de la app ANTES de que Sandra dé el precio.
-const CHAT_URL = 'https://vigilant-quietude-production-75938095.up.railway.app'; // ← sin "/" al final
-const CHAT_API_KEY = 'PEGA_AQUI_EL_API_KEY_DEL_CHAT'; // ← el mismo x-api-key que usa el nodo que responde
+// La URL y la clave del chat NO van aquí: se leen del nodo "Configuración" (chatUrl, chatApiKey),
+// así este código se puede volver a pegar sin perderlas.
+const config = (() => {
+  try { return $('Configuración').first().json; } catch (e) { return {}; } // sin nodo Configuración: no se registra
+})();
+const CHAT_URL = String(config.chatUrl ?? '').trim().replace(/\/+$/, '');
+const CHAT_API_KEY = String(config.chatApiKey ?? '').trim();
 
-// Lo que Sandra debe decir siempre que da un precio.
-const PRECOTIZACION = ' IMPORTANTE: aclara que es una precotización y que el costo final puede variar. Termina preguntándole si quiere continuar con el trámite.';
-const conCodigo = (codigo) => codigo
-  ? ` IMPORTANTE: el cliente YA recibió en un mensaje aparte su código de seguimiento (${codigo}) y los links de la app. No los repitas ni escribas ningún código. Da solo el precio, aclarando que es una precotización y que el costo final puede variar.`
-  : PRECOTIZACION;
+// Lo que Sandra hace siempre que da un precio definido.
+const AL_DAR_PRECIO = ' Da el precio UNA sola vez, en un solo mensaje, aclarando que es una precotización y que el costo final puede variar.'
+  + ' Menciona el servicio solo por su nombre: NO expliques qué incluye ni en qué se diferencia de los otros, salvo que el cliente lo pregunte (entonces usa diferencias_servicios).'
+  + ' No escribas ningún código.'
+  + ' Termina preguntando: "¿Te gustaría avanzar con eso?".'
+  + ' Cuando el cliente responda que sí o que no, llama a respuesta_cotizacion con acepta true o false.';
 
 const respuesta = $input.first().json;
 const { resumen, body, sigevUrl } = $('Traducir a IDs').first().json;
 const token = $('Entrar a SIGEV').first().json.token;
 const conversationId = $('Cuando lo llama el agente').first().json.conversationId;
 
-// Guarda la precotización en el chat y hace que el servidor mande el mensaje con el código. Devuelve el código o null.
-const guardarPrecotizacion = async (precio, servicio) => {
-  if (!conversationId || CHAT_API_KEY.startsWith('PEGA_')) return null;
+// Registra en el chat el precio que se le va a dar al cliente (todavía no es precotización).
+// Si falla, el motivo queda en error_registro (sale en la salida del nodo) y Sandra da el precio igual.
+let errorRegistro = null;
+const registrarCotizacion = async (precio, servicioClave) => {
+  if (!CHAT_URL || !CHAT_API_KEY) { errorRegistro = 'Falta chatUrl o chatApiKey en el nodo Configuración'; return; }
+  if (!conversationId) { errorRegistro = 'Falta conversationId (revisa la herramienta cotizar_tramite en el AI Agent)'; return; }
   try {
-    const r = await this.helpers.httpRequest({
+    await this.helpers.httpRequest({
       method: 'POST',
-      url: `${CHAT_URL}/api/conversations/${conversationId}/precotizaciones`,
+      url: `${CHAT_URL}/api/conversations/${conversationId}/cotizacion`,
       headers: { 'x-api-key': CHAT_API_KEY, Accept: 'application/json' },
       body: {
-        tramite: resumen.tramite, estado: resumen.estado, vehiculo: resumen.vehiculo, servicio,
-        costo: precio.costo, mas_impuestos: precio.mas_impuestos, enviar_mensaje: true,
+        tramite: resumen.tramite, id_tramite: resumen.id_tramite, nombre_tramite: resumen.nombre_tramite,
+        estado: resumen.estado, vehiculo: resumen.vehiculo, servicio: servicioClave,
+        costo: precio.costo, mas_impuestos: precio.mas_impuestos,
+        sigev: { ...(resumen.sigev ?? {}), tipo_servicio: `${ID_SERVICIO[servicioClave]}-${servicioClave}` },
       },
       json: true,
       timeout: 10000,
     });
-    return r.codigo || null;
   } catch (e) {
-    return null; // si falla, Sandra da el precio igual (sin código)
+    const estado = e.httpCode ?? e.response?.status ?? e.statusCode;
+    errorRegistro = `No se pudo registrar en ${CHAT_URL} (conversación ${conversationId})`
+      + (estado ? `: HTTP ${estado}` : '') + ` ${e.message ?? ''}`.trimEnd()
+      + (String(estado) === '401' ? ' → chatApiKey incorrecta' : '')
+      + (String(estado) === '404' ? ' → esa conversación no existe en ese servidor (¿chatUrl de otro servidor?)' : '');
   }
 };
 
@@ -64,6 +81,16 @@ const texto = (p) => `${p.precio}${p.mas_impuestos ? ' más impuestos' : ''}`
   + (p.tiempo_entrega ? `, entrega en ${p.tiempo_entrega}` : '')
   + (p.notas ? ` (nota: ${p.notas})` : '');
 
+// Respuesta con un precio definido (ya registrado en el chat)
+const conPrecio = async (precio, servicioClave, extra = '') => {
+  await registrarCotizacion(precio, servicioClave);
+  return [{ json: {
+    encontrado: true, ...resumen, ...precio, servicio: servicioClave,
+    diferencias_servicios: DIFERENCIAS, error_registro: errorRegistro ?? undefined,
+    mensaje: `Precio exacto con servicio ${servicioClave}: ${texto(precio)}.${extra} Dáselo al cliente mencionando trámite, estado, vehículo y servicio.` + AL_DAR_PRECIO,
+  } }];
+};
+
 // --- Precio con el servicio pedido -----------------------------------------
 if (respuesta.statusCode === 401) {
   return [{ json: { encontrado: false, ...resumen,
@@ -72,12 +99,7 @@ if (respuesta.statusCode === 401) {
 
 const pedido = respuesta.statusCode === 200 ? leerPrecio(respuesta.body) : null;
 if (pedido && resumen.servicioIndicado) {
-  const codigo = await guardarPrecotizacion(pedido, SERVICIOS[body.id_tiposervicio].clave);
-  return [{ json: {
-    encontrado: true, ...resumen, ...pedido, codigo,
-    diferencias_servicios: DIFERENCIAS,
-    mensaje: `Precio exacto con servicio ${resumen.servicio}: ${texto(pedido)}. Dáselo al cliente tal cual, mencionando trámite, estado, vehículo y servicio. Si pregunta en qué se diferencian los servicios, usa diferencias_servicios.` + conCodigo(codigo),
-  } }];
+  return await conPrecio(pedido, SERVICIOS[body.id_tiposervicio].clave);
 }
 
 // --- No hay precio: probar los otros servicios ------------------------------
@@ -104,28 +126,26 @@ for (const [id, servicio] of Object.entries(SERVICIOS)) {
   }
 }
 
-if (alternativas.length && !resumen.servicioIndicado) {
-  const lista = alternativas.map((a) => `${a.servicio} (${a.descripcion}) ${texto(a)}`).join('; ');
-  const unico = alternativas.length === 1;
-  // Con un solo servicio posible el precio ya está definido; con varios, se espera a que el cliente elija
-  const codigo = unico ? await guardarPrecotizacion(alternativas[0], alternativas[0].servicio) : null;
-  return [{ json: {
-    encontrado: true, ...resumen, codigo,
-    alternativas,
-    diferencias_servicios: DIFERENCIAS,
-    mensaje: unico
-      ? `Precio exacto: ${lista}. Es el único servicio disponible para esta combinación. Dáselo al cliente tal cual, mencionando trámite, estado, vehículo y el servicio ${alternativas[0].servicio} con su descripción.` + conCodigo(codigo)
-      : `Precios exactos por servicio: ${lista}. Dale al cliente las opciones de forma breve, con la diferencia entre ellas, y pregúntale cuál prefiere. Cuando elija, vuelve a llamar a cotizar_tramite con ese servicio.`,
-  } }];
+// Un solo servicio posible: ese es el precio
+if (alternativas.length === 1) {
+  const [unica] = alternativas;
+  const aviso = resumen.servicioIndicado
+    ? ` Para esa combinación el único servicio disponible es ${unica.servicio} (no menciones ${resumen.servicio}).`
+    : ' Es el único servicio disponible para esta combinación.';
+  return await conPrecio(unica, unica.servicio, aviso);
 }
 
+// Varios servicios: el cliente elige y se vuelve a cotizar con ese servicio
 if (alternativas.length) {
   const lista = alternativas.map((a) => `${a.servicio} (${a.descripcion}) ${texto(a)}`).join('; ');
+  const intro = resumen.servicioIndicado
+    ? `Con servicio ${resumen.servicio} no se ofrece este trámite para ese estado y vehículo. Sí está disponible con: ${lista}. No ofrezcas el servicio ${resumen.servicio}.`
+    : `Precios exactos por servicio: ${lista}.`;
   return [{ json: {
-    encontrado: false, ...resumen,
+    encontrado: !resumen.servicioIndicado, ...resumen,
     alternativas,
     diferencias_servicios: DIFERENCIAS,
-    mensaje: `Con servicio ${resumen.servicio} no se ofrece este trámite para ese estado y vehículo. Sí está disponible con: ${lista}. Díselo al cliente de forma breve, explícale la diferencia y pregúntale si le interesa. No ofrezcas el servicio ${resumen.servicio}. Si acepta otro servicio, vuelve a llamar a cotizar_tramite con ese servicio.`,
+    mensaje: `${intro} Dale al cliente las opciones de forma breve, con la diferencia entre ellas, y pregúntale cuál prefiere. Cuando elija, vuelve a llamar a cotizar_tramite con ese servicio. Todavía no le preguntes si quiere avanzar.`,
   } }];
 }
 

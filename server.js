@@ -21,6 +21,10 @@ const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET || '';
 // CRM (leadsgg): ahí se crea el lead cuando el cliente acepta continuar el trámite
 const CRM_URL = (process.env.CRM_URL || '').replace(/\/+$/, '');
 const CRM_API_TOKEN = process.env.CRM_API_TOKEN || '';
+// SIGEV: usuario (que también es socio) con el que el chat genera las cotizaciones de costo fijo
+const SIGEV_URL = (process.env.SIGEV_URL || 'https://my.grupogevhe.com').replace(/\/+$/, '');
+const SIGEV_EMAIL = process.env.SIGEV_EMAIL || '';
+const SIGEV_PASSWORD = process.env.SIGEV_PASSWORD || '';
 const APP_ANDROID_URL = process.env.APP_ANDROID_URL || 'https://play.google.com/store/apps/details?id=com.grupogevhe.app&hl=es_MX';
 const APP_IOS_URL = process.env.APP_IOS_URL || 'https://apps.apple.com/mx/app/gevhe-app/id6759180407';
 // Primer mensaje de la influencer en cada conversación nueva. GREETING_MESSAGE=off lo desactiva.
@@ -324,30 +328,10 @@ app.post('/api/conversations/:conversationId/precotizaciones', requireApiKey, as
   if (!conversation) return res.status(404).json({ error: 'Conversación no encontrada' });
 
   const body = req.body || {};
-  const texto = (v, max) => {
-    const s = String(v ?? '').replace(/\s+/g, ' ').trim();
-    return s ? s.slice(0, max) : null;
-  };
-  const tramite = texto(body.tramite, 120);
-  if (!tramite) return res.status(400).json({ error: 'tramite es obligatorio' });
+  const datos = leerDatosCotizacion(body);
+  if (datos.error) return res.status(400).json({ error: datos.error });
 
-  let costo = null;
-  if (body.costo !== undefined && body.costo !== null && body.costo !== '') {
-    costo = Number(String(body.costo).replace(/[$,\s]/g, ''));
-    if (!Number.isFinite(costo) || costo < 0) return res.status(400).json({ error: 'costo no es un número válido' });
-  }
-
-  const { precotizacion, created } = await db.createPrecotizacion(conversation, {
-    tramite,
-    estado: texto(body.estado, 60),
-    vehiculo: texto(body.vehiculo, 60),
-    servicio: texto(body.servicio, 20),
-    costo,
-    masImpuestos: body.mas_impuestos === true || body.mas_impuestos === 'true' || body.mas_impuestos === 1,
-    // Nombre oficial del trámite en SIGEV (lo manda n8n): "Licencia de manejo", "Cambio de propietario"
-    idTramite: Number.isInteger(Number(body.id_tramite)) && Number(body.id_tramite) > 0 ? Number(body.id_tramite) : null,
-    nombreTramite: texto(body.nombre_tramite, 150),
-  });
+  const { precotizacion, created } = await db.createPrecotizacion(conversation, datos);
 
   // Con enviar_mensaje, el servidor manda al chat el código y los links de la app (solo la primera vez):
   // así el código nunca lo escribe el bot y siempre llega antes que el precio.
@@ -367,11 +351,54 @@ app.post('/api/conversations/:conversationId/precotizaciones', requireApiKey, as
   });
 });
 
+// Datos de un precio (los manda n8n). Devuelve { error } o los datos listos para guardar.
+function leerDatosCotizacion(body) {
+  const texto = (v, max) => {
+    const s = String(v ?? '').replace(/\s+/g, ' ').trim();
+    return s ? s.slice(0, max) : null;
+  };
+  const tramite = texto(body.tramite, 120);
+  if (!tramite) return { error: 'tramite es obligatorio' };
+
+  let costo = null;
+  if (body.costo !== undefined && body.costo !== null && body.costo !== '') {
+    costo = Number(String(body.costo).replace(/[$,\s]/g, ''));
+    if (!Number.isFinite(costo) || costo < 0) return { error: 'costo no es un número válido' };
+  }
+  const idTramite = Number(body.id_tramite);
+
+  // Valores "id-ALIAS" que pide SIGEV para crear la cotización (18-LICEN, 2-MOTO, 15-EDOMEX, 3-CL, 70-2018)
+  const sigev = {};
+  for (const campo of ['tipo_tramite', 'tipo_vehiculo', 'entidad', 'tipo_servicio', 'modelo']) {
+    const v = texto(body.sigev?.[campo], 60);
+    if (v && /^\d+-.+/.test(v)) sigev[campo] = v;
+  }
+
+  return {
+    tramite,
+    estado: texto(body.estado, 60),
+    vehiculo: texto(body.vehiculo, 60),
+    servicio: texto(body.servicio, 20),
+    costo,
+    masImpuestos: body.mas_impuestos === true || body.mas_impuestos === 'true' || body.mas_impuestos === 1,
+    // Nombre oficial del trámite en SIGEV (lo manda n8n): "Licencia de manejo", "Cambio de propietario"
+    idTramite: Number.isInteger(idTramite) && idTramite > 0 ? idTramite : null,
+    nombreTramite: texto(body.nombre_tramite, 150),
+    sigev,
+  };
+}
+
+// [copiar]…[/copiar] y [texto](url) los dibuja el chat como botón de copiar y como link
+const LINKS_APP = `Android: [Descargar](${APP_ANDROID_URL})\niPhone: [Descargar](${APP_IOS_URL})`;
 const mensajeCodigoApp = (codigo) =>
-  `Tu código de seguimiento es: ${codigo} ✨\n` +
-  'Descarga la app de GEVHE e ingresa con él para continuar tu trámite 📲\n' +
-  `Android: ${APP_ANDROID_URL}\n` +
-  `iPhone: ${APP_IOS_URL}`;
+  `El código de tu precotización es [copiar]${codigo}[/copiar] puedes usarlo en la app para darle seguimiento a tu precotización. ` +
+  `Puedes descargar la app desde los siguientes links:\n${LINKS_APP}`;
+const MENSAJE_ASESOR = 'Un asesor se contactará contigo por medio de nuestra app 🙌';
+const mensajeCodigoTramite = (clave, correo) =>
+  `El código de tu trámite es [copiar]${clave}[/copiar] guárdalo bien, será tu contraseña 🔐\n` +
+  `Para continuar descarga la app desde los siguientes links:\n${LINKS_APP}\n` +
+  'En la pantalla de login ingresa tu correo (el que me diste) y en contraseña el código de tu trámite. Ejemplo:\n' +
+  `Correo electrónico: ${correo}\nContraseña: ${clave}`;
 
 // Mensaje de la influencer generado por el servidor (no por n8n)
 async function sendInfluencerMessage(conversation, content) {
@@ -383,6 +410,220 @@ async function sendInfluencerMessage(conversation, content) {
   // Sandra sigue "escribiendo" el precio que n8n manda enseguida
   io.to(room(conversation.id)).emit('typing', { typing: true });
   return msg;
+}
+
+// ---------- Flujo de cotización del chat ----------
+// 1) n8n (cotizar_tramite) da el precio y lo registra aquí → POST .../cotizacion
+// 2) El cliente responde si quiere avanzar          → POST .../respuesta-cotizacion { acepta }
+//    No: su lead regresa a la primera columna de Comercial.
+//    Sí, sin costo fijo (más impuestos): precotización PRE + "un asesor te contactará".
+//    Sí, con costo fijo: Sandra pide nombre y correo.
+// 3) Con nombre y correo                            → POST .../generar-cotizacion { nombre, correo }
+//    Se crea la cotización en SIGEV (COTA…) y el cliente recibe su código para entrar a la app.
+
+const ahora = () => new Date().toISOString();
+
+// Último precio que se le dio al cliente. Todavía NO es precotización (no va a ent_precotizaciones).
+app.post('/api/conversations/:conversationId/cotizacion', requireApiKey, async (req, res) => {
+  const conversation = await findConversation(req.params.conversationId);
+  if (!conversation) return res.status(404).json({ error: 'Conversación no encontrada' });
+  const datos = leerDatosCotizacion(req.body || {});
+  if (datos.error) return res.status(400).json({ error: datos.error });
+  // Costo fijo = SIGEV no le suma impuestos (mas_impuestos = 0)
+  const cotizacion = { ...datos, costoFijo: !datos.masImpuestos, aceptada: null, cotizadaAt: ahora() };
+  await db.setUltimaCotizacion(conversation.id, cotizacion);
+  res.json({ ok: true, costo_fijo: cotizacion.costoFijo, cotizacion });
+});
+
+app.post('/api/conversations/:conversationId/respuesta-cotizacion', requireApiKey, async (req, res) => {
+  const conversation = await findConversation(req.params.conversationId);
+  if (!conversation) return res.status(404).json({ error: 'Conversación no encontrada' });
+
+  const valor = String(req.body?.acepta ?? '').trim().toLowerCase();
+  let acepta = null;
+  if (['true', 'si', 'sí', '1'].includes(valor)) acepta = true;
+  else if (['false', 'no', '0'].includes(valor)) acepta = false;
+  if (acepta === null) return res.status(400).json({ error: 'acepta debe ser true o false' });
+
+  const cotizacion = db.getUltimaCotizacion(conversation);
+  if (!cotizacion) {
+    return res.status(409).json({
+      ok: false,
+      mensaje: 'Todavía no le has dado un precio a este cliente. Pregúntale qué trámite necesita y usa cotizar_tramite.',
+    });
+  }
+
+  await db.setUltimaCotizacion(conversation.id, { ...cotizacion, aceptada: acepta, respondidaAt: ahora() });
+
+  if (!acepta) {
+    const crm = await actualizarLeadEnCrm(conversation, { primera_columna: true });
+    return res.json({
+      ok: true,
+      acepta,
+      crm,
+      mensaje: 'El cliente no quiere avanzar. Respóndele breve y amable que aquí estás si cambia de opinión o necesita otro trámite. No insistas ni repitas el precio.',
+    });
+  }
+
+  if (cotizacion.costoFijo) {
+    return res.json({
+      ok: true,
+      acepta,
+      costo_fijo: true,
+      mensaje: 'El cliente quiere avanzar y el trámite tiene costo fijo. Pídele en un solo mensaje su nombre completo y su correo electrónico (con ese correo entrará a la app). Cuando te los dé, llama a generar_cotizacion con nombre y correo. No le des ningún código todavía.',
+    });
+  }
+
+  const { codigo, nueva } = await enviarPrecotizacion(conversation, cotizacion);
+  res.json({
+    ok: true,
+    acepta,
+    costo_fijo: false,
+    codigo,
+    nueva,
+    mensaje: nueva
+      ? `El cliente YA recibió en mensajes aparte que un asesor lo contactará por la app y su código de precotización (${codigo}) con los links de la app. NO repitas el código, los links ni el precio. Responde solo una frase corta de cierre, por ejemplo: "¿Te puedo ayudar con algo más? 😊".`
+      : `El cliente ya tenía su código de precotización (${codigo}) y los links de la app. NO los repitas: responde solo a lo último que dijo.`,
+  });
+});
+
+app.post('/api/conversations/:conversationId/generar-cotizacion', requireApiKey, async (req, res) => {
+  const conversation = await findConversation(req.params.conversationId);
+  if (!conversation) return res.status(404).json({ error: 'Conversación no encontrada' });
+
+  const nombre = String(req.body?.nombre ?? '').replace(/\s+/g, ' ').trim();
+  const correo = String(req.body?.correo ?? '').trim().toLowerCase();
+  if (nombre.length < 2 || nombre.length > 100) {
+    return res.status(400).json({ ok: false, mensaje: 'Falta el nombre completo del cliente: pídeselo.' });
+  }
+  if (correo.length > 150 || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(correo)) {
+    return res.status(400).json({ ok: false, mensaje: `El correo "${correo}" no es válido: pídeselo de nuevo al cliente.` });
+  }
+
+  const cotizacion = db.getUltimaCotizacion(conversation);
+  if (!cotizacion || cotizacion.aceptada !== true || !cotizacion.costoFijo) {
+    return res.status(409).json({
+      ok: false,
+      mensaje: 'Solo se genera cuando el cliente aceptó un precio de costo fijo. Usa primero cotizar_tramite y respuesta_cotizacion.',
+    });
+  }
+  if (cotizacion.claveCotizacion) {
+    return res.json({
+      ok: true,
+      clave: cotizacion.claveCotizacion,
+      nueva: false,
+      mensaje: `El cliente ya tiene su código (${cotizacion.claveCotizacion}) y las instrucciones de la app. NO los repitas: responde solo a lo último que dijo.`,
+    });
+  }
+
+  await db.setLeadDatos(conversation.id, nombre, correo);
+  const crm = await actualizarLeadEnCrm({ ...conversation, lead_name: nombre }, { nombre, correo });
+
+  let clave = null;
+  let errorSigev = null;
+  try {
+    clave = await crearCotizacionSigev(cotizacion, nombre, correo);
+  } catch (err) {
+    errorSigev = err.message;
+    console.error(`SIGEV: no se generó la cotización de la conversación ${conversation.id}: ${err.message}`);
+  }
+
+  if (!clave) {
+    // Sin SIGEV no hay código para la app: sigue como precotización y lo atiende un asesor
+    const { codigo } = await enviarPrecotizacion(conversation, cotizacion);
+    return res.json({
+      ok: true,
+      sigev: false,
+      error_sigev: errorSigev,
+      codigo,
+      crm,
+      mensaje: `No se pudo generar el trámite; el cliente YA recibió que un asesor lo contactará por la app y su código de precotización (${codigo}). NO repitas el código ni los links. Responde solo una frase corta de cierre.`,
+    });
+  }
+
+  await db.setUltimaCotizacion(conversation.id, { ...cotizacion, claveCotizacion: clave, nombre, correo, generadaAt: ahora() });
+  const { precotizacion } = await db.createPrecotizacion(conversation, { ...cotizacion, claveCotizacion: clave });
+  await sendInfluencerMessage(conversation, mensajeCodigoTramite(clave, correo));
+
+  res.json({
+    ok: true,
+    sigev: true,
+    clave,
+    codigo: precotizacion.codigo,
+    crm,
+    mensaje: `El cliente YA recibió en un mensaje aparte el código de su trámite (${clave}), los links de la app y cómo iniciar sesión. NO repitas el código, los links ni las instrucciones. Responde solo una frase corta de cierre, por ejemplo: "¡Listo! Cualquier duda aquí estoy 😊".`,
+  });
+});
+
+// Guarda la precotización (PRE…) y manda "un asesor te contactará" + el código con los links de la app
+async function enviarPrecotizacion(conversation, cotizacion) {
+  const { precotizacion, created } = await db.createPrecotizacion(conversation, cotizacion);
+  if (created) {
+    await sendInfluencerMessage(conversation, MENSAJE_ASESOR);
+    await new Promise((r) => setTimeout(r, SPLIT_DELAY_MS));
+    await sendInfluencerMessage(conversation, mensajeCodigoApp(precotizacion.codigo));
+  }
+  return { codigo: precotizacion.codigo, nueva: created };
+}
+
+// ---------- SIGEV ----------
+async function sigevPost(ruta, body, token) {
+  const resp = await fetch(`${SIGEV_URL}${ruta}`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15000),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || data.success === false || data.status === 'error') {
+    const detalle = data.error || data.message || (data.errors && JSON.stringify(data.errors)) || 'sin detalle';
+    throw new Error(`${ruta} → HTTP ${resp.status}: ${detalle}`);
+  }
+  return data;
+}
+
+// "Juan Carlos Pérez López" → nombre "Juan Carlos", apellidos "Pérez López"
+function separarNombre(completo) {
+  const partes = completo.split(' ');
+  if (partes.length === 1) return { nombre: completo, apellidos: '' };
+  const nApellidos = partes.length >= 3 ? 2 : 1;
+  return { nombre: partes.slice(0, -nApellidos).join(' '), apellidos: partes.slice(-nApellidos).join(' ') };
+}
+
+// Crea la cotización en SIGEV a nombre del cliente y devuelve su clave (COTA…).
+// El cliente entra a la app con su correo y esa clave; el trámite A se genera en la app al pagar el anticipo.
+async function crearCotizacionSigev(cotizacion, nombreCompleto, correo) {
+  if (!SIGEV_EMAIL || !SIGEV_PASSWORD) throw new Error('SIGEV_EMAIL o SIGEV_PASSWORD sin configurar');
+  const s = cotizacion.sigev || {};
+  const faltan = ['tipo_tramite', 'tipo_vehiculo', 'entidad', 'tipo_servicio'].filter((c) => !s[c]);
+  if (faltan.length) throw new Error(`faltan datos para SIGEV (${faltan.join(', ')}): actualiza el código de n8n`);
+
+  const { token } = await sigevPost('/api/login', { email: SIGEV_EMAIL, password: SIGEV_PASSWORD });
+  if (!token) throw new Error('SIGEV no devolvió token');
+
+  const creada = await sigevPost(
+    '/api/cotizacion/createCotizacionExpres',
+    { ...s, email: correo, subtotal: cotizacion.costo ?? 0, descuento: 0 },
+    token
+  );
+  if (!creada.clave) throw new Error('SIGEV no devolvió la clave de la cotización');
+
+  // La cotización exprés se crea a nombre de "DATOS PENDIENTES": se le pone el nombre real del cliente
+  const { nombre, apellidos } = separarNombre(nombreCompleto);
+  try {
+    await sigevPost(
+      '/api/cotizacion/actualizar',
+      { datos_completos: 0, clave: creada.clave, nombre, apellidos, email: correo },
+      token
+    );
+  } catch (err) {
+    console.error(`SIGEV: la cotización ${creada.clave} se creó, pero no se le pudo poner el nombre: ${err.message}`);
+  }
+  return creada.clave;
 }
 
 app.get('/api/conversations/:conversationId/precotizaciones', requireApiKey, async (req, res) => {
@@ -433,6 +674,54 @@ app.get('/api/precotizaciones/:codigo', requireApiKey, async (req, res) => {
   res.json({ precotizacion });
 });
 
+// Primer mensaje del cliente: se crea su lead en el CRM (tablero Comercial, columna Web).
+// Solo una vez por conversación; si el CRM falla, se reintenta con el siguiente mensaje.
+const leadsEnCurso = new Set();
+async function crearLeadWeb(conversationId, nombreCliente) {
+  if (!CRM_URL || !CRM_API_TOKEN || leadsEnCurso.has(conversationId)) return;
+  leadsEnCurso.add(conversationId);
+  try {
+    const conv = await db.getConversation(conversationId);
+    if (!conv || conv.crm_lead_id) return;
+    const nombre = conv.lead_name || (nombreCliente && nombreCliente !== 'Cliente' ? nombreCliente : null);
+    const crm = await crearLeadEnCrm(conv, nombre);
+    if (crm.leadId) await db.setCrmLeadId(conv.id, crm.leadId);
+  } catch (err) {
+    console.error(`CRM: error creando el lead de la conversación ${conversationId}:`, err.message);
+  } finally {
+    leadsEnCurso.delete(conversationId);
+  }
+}
+
+// Cambia el lead de la conversación en el CRM: { primera_columna: true } lo regresa a la primera
+// columna del tablero Comercial; { nombre, correo } actualizan sus datos. Si aún no existe, lo crea antes.
+async function actualizarLeadEnCrm(conv, cambios) {
+  if (!CRM_URL || !CRM_API_TOKEN) return { sincronizado: false, motivo: 'CRM_URL o CRM_API_TOKEN sin configurar' };
+  try {
+    if (!conv.crm_lead_id) {
+      const creado = await crearLeadEnCrm(conv, conv.lead_name || null);
+      if (!creado.leadId) return { sincronizado: false, motivo: 'no se pudo crear el lead' };
+      await db.setCrmLeadId(conv.id, creado.leadId);
+    }
+    const resp = await fetch(`${CRM_URL}/api/lead/influencer/actualizar`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${CRM_API_TOKEN}`, Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversacion_id: conv.id, ...cambios }),
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.success) {
+      console.error(`CRM: no se actualizó el lead de la conversación ${conv.id} (${resp.status}): ${data.message ?? 'sin detalle'}`);
+      return { sincronizado: false, motivo: data.message ?? `HTTP ${resp.status}` };
+    }
+    return { sincronizado: true, leadId: data.lead_id, columna: data.columna ?? null };
+  } catch (err) {
+    console.error(`CRM: no se pudo conectar para la conversación ${conv.id}: ${err.message}`);
+    return { sincronizado: false, motivo: err.message };
+  }
+}
+
+// Crea (o recupera, si ya existía) el lead de la conversación en el CRM
 async function crearLeadEnCrm(conv, nombre) {
   const influencer = await db.getInfluencer(conv.influencer_id);
   try {
@@ -442,7 +731,7 @@ async function crearLeadEnCrm(conv, nombre) {
       body: JSON.stringify({
         conversacion_id: conv.id,
         nombre,
-        codigo_app: conv.app_code,
+        codigo_app: conv.app_code ?? null,
         influencer_id: conv.influencer_id,
         influencer_nombre: influencer?.name ?? null,
         origen: conv.referral_valid ? conv.source : null,
@@ -654,6 +943,7 @@ io.on('connection', async (socket) => {
       reply({ ok: true, id: msg.id });
 
       scheduleAutoTyping(conversation.id);
+      void crearLeadWeb(conversation.id, client.name);
       void notifyN8n({
         event: 'message.received',
         conversationId: conversation.id,

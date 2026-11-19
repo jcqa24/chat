@@ -54,22 +54,79 @@
     return node;
   }
 
-  // Texto con las URLs (http/https) convertidas en links. Se arma con nodos, nunca con innerHTML.
-  const URL_RE = /https?:\/\/[^\s<>"']+/g;
+  // Texto enriquecido de los mensajes. Se arma con nodos, nunca con innerHTML. Reconoce:
+  //   [copiar]PRE0000001[/copiar]  → el código con un botón para copiarlo
+  //   [Descargar](https://…)       → link con texto
+  //   https://…                    → link con la URL visible
+  const RICH_RE = /\[copiar\]([A-Za-z0-9-]{1,20})\[\/copiar\]|\[([^\]\n]{1,40})\]\((https?:\/\/[^\s)<>"']+)\)|https?:\/\/[^\s<>"']+/g;
   const TRAILING_PUNCT_RE = /[.,;:!?)\]}¡¿]+$/; // "…id=123." → el punto no es parte del link
+
+  function makeLink(url, label) {
+    const a = el('a', 'bubble-link', label);
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    return a;
+  }
+
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Sin permiso de portapapeles (o sin https): copia con un textarea temporal
+      const tmp = el('textarea');
+      tmp.value = text;
+      tmp.setAttribute('readonly', '');
+      tmp.style.cssText = 'position:fixed;opacity:0;pointer-events:none';
+      document.body.append(tmp);
+      tmp.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
+      tmp.remove();
+      return ok;
+    }
+  }
+
+  function makeCopyChip(code) {
+    const chip = el('span', 'copy-chip');
+    chip.append(el('code', 'copy-chip__code', code));
+    const btn = el('button', 'copy-chip__btn', 'Copiar');
+    btn.type = 'button';
+    btn.setAttribute('aria-label', `Copiar ${code}`);
+    btn.addEventListener('click', async () => {
+      const ok = await copyText(code);
+      btn.textContent = ok ? '¡Copiado!' : 'No se pudo';
+      btn.classList.toggle('is-done', ok);
+      setTimeout(() => {
+        btn.textContent = 'Copiar';
+        btn.classList.remove('is-done');
+      }, 1800);
+    });
+    chip.append(btn);
+    return chip;
+  }
+
   function linkify(node, text) {
     let last = 0;
-    for (const match of text.matchAll(URL_RE)) {
-      let url = match[0];
-      const trailing = url.match(TRAILING_PUNCT_RE);
-      if (trailing) url = url.slice(0, -trailing[0].length);
+    for (const match of text.matchAll(RICH_RE)) {
+      const [whole, code, label, labeledUrl] = match;
+      let length = whole.length;
+      let part;
+      if (code) {
+        part = makeCopyChip(code);
+      } else if (label) {
+        part = makeLink(labeledUrl, label);
+      } else {
+        let url = whole;
+        const trailing = url.match(TRAILING_PUNCT_RE);
+        if (trailing) url = url.slice(0, -trailing[0].length);
+        length = url.length;
+        part = makeLink(url, url);
+      }
       if (match.index > last) node.append(text.slice(last, match.index));
-      const a = el('a', 'bubble-link', url);
-      a.href = url;
-      a.target = '_blank';
-      a.rel = 'noopener noreferrer';
-      node.append(a);
-      last = match.index + url.length;
+      node.append(part);
+      last = match.index + length;
     }
     if (last < text.length) node.append(text.slice(last));
     return node;

@@ -138,6 +138,9 @@ async function init() {
       app_code                VARCHAR(12)   NULL,
       app_code_at             DATETIME(3)   NULL,
       crm_lead_id             INT           NULL,
+      lead_email              VARCHAR(150)  NULL,
+      ultima_cotizacion       TEXT          NULL,
+      ultima_cotizacion_at    DATETIME(3)   NULL,
       created_at              DATETIME(3)   NOT NULL,
       UNIQUE KEY uq_conv_influencer_client (influencer_id, client_id),
       UNIQUE KEY uq_conv_app_code (app_code),
@@ -158,6 +161,10 @@ async function init() {
     app_code: 'VARCHAR(12) NULL AFTER lead_name',
     app_code_at: 'DATETIME(3) NULL AFTER app_code',
     crm_lead_id: 'INT NULL AFTER app_code_at',
+    // Flujo de cotización del chat: correo del cliente y último precio que se le dio (JSON)
+    lead_email: 'VARCHAR(150) NULL AFTER crm_lead_id',
+    ultima_cotizacion: 'TEXT NULL AFTER lead_email',
+    ultima_cotizacion_at: 'DATETIME(3) NULL AFTER ultima_cotizacion',
   };
   for (const [col, def] of Object.entries(sourceColumns)) {
     if (!(await columnExists('conversations_influencers', col))) {
@@ -218,6 +225,7 @@ async function init() {
       servicio        VARCHAR(20)   NULL,
       costo           DECIMAL(12,2) NULL,
       mas_impuestos   TINYINT(1)    NOT NULL DEFAULT 0,
+      clave_cotizacion VARCHAR(20)  NULL COMMENT 'Cotización que el chat generó en SIGEV (COTA0001451); el cliente entra con ella a la app',
       clave_tramite   VARCHAR(20)   NULL COMMENT 'Clave del trámite en SIGEV (A0064466) cuando el cliente lo ingresa',
       tramite_at      DATETIME(3)   NULL COMMENT 'Cuándo se registró clave_tramite',
       created_at      DATETIME(3)   NOT NULL,
@@ -243,6 +251,10 @@ async function init() {
     await pool.query(`ALTER TABLE ent_precotizaciones
       ADD COLUMN id_tramite INT NULL COMMENT 'id de cat_tramite en SIGEV' AFTER tramite,
       MODIFY COLUMN nombre_tramite VARCHAR(150) NULL COMMENT 'Nombre del trámite en el catálogo de SIGEV (Licencia de manejo, Cambio de propietario)' AFTER id_tramite`);
+  }
+  if (!(await columnExists('ent_precotizaciones', 'clave_cotizacion'))) {
+    await pool.query(`ALTER TABLE ent_precotizaciones
+      ADD COLUMN clave_cotizacion VARCHAR(20) NULL COMMENT 'Cotización que el chat generó en SIGEV (COTA0001451); el cliente entra con ella a la app' AFTER mas_impuestos`);
   }
 
   // Vistas de estadísticas para el CRM (solo cuentan referidos válidos)
@@ -550,6 +562,35 @@ async function setCrmLeadId(conversationId, leadId) {
   await pool.query('UPDATE conversations_influencers SET crm_lead_id = ? WHERE id = ?', [leadId, conversationId]);
 }
 
+/** Nombre y correo que el cliente le dio a Sandra. */
+async function setLeadDatos(conversationId, nombre, correo) {
+  await pool.query('UPDATE conversations_influencers SET lead_name = ?, lead_email = ? WHERE id = ?', [
+    nombre,
+    correo,
+    conversationId,
+  ]);
+}
+
+/**
+ * Último precio que Sandra le dio al cliente (JSON). Todavía no es precotización: se usa cuando el
+ * cliente responde si quiere avanzar, y ahí se van agregando los pasos (aceptada, clave de SIGEV...).
+ */
+async function setUltimaCotizacion(conversationId, cotizacion) {
+  await pool.query(
+    'UPDATE conversations_influencers SET ultima_cotizacion = ?, ultima_cotizacion_at = ? WHERE id = ?',
+    [JSON.stringify(cotizacion), new Date(), conversationId]
+  );
+}
+
+function getUltimaCotizacion(conversation) {
+  if (!conversation?.ultima_cotizacion) return null;
+  try {
+    return JSON.parse(conversation.ultima_cotizacion);
+  } catch {
+    return null;
+  }
+}
+
 // ---------- Precotizaciones ----------
 const PRECOT_PREFIX = 'PRE';
 const precotCode = (id) => PRECOT_PREFIX + String(id).padStart(7, '0');
@@ -568,6 +609,7 @@ function toPrecotizacionDto(row) {
     servicio: row.servicio,
     costo: row.costo === null ? null : Number(row.costo),
     mas_impuestos: !!row.mas_impuestos,
+    clave_cotizacion: row.clave_cotizacion ?? null,
     clave_tramite: row.clave_tramite ?? null,
     tramite_at: iso(row.tramite_at),
     created_at: iso(row.created_at),
@@ -598,10 +640,10 @@ async function createPrecotizacion(conversation, datos) {
     const [res] = await conn.query(
       `INSERT INTO ent_precotizaciones
          (conversation_id, influencer_id, tramite, estado, vehiculo, servicio, costo, mas_impuestos,
-          id_tramite, nombre_tramite, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          id_tramite, nombre_tramite, clave_cotizacion, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [conversation.id, conversation.influencer_id, ...campos, datos.masImpuestos ? 1 : 0,
-        datos.idTramite ?? null, datos.nombreTramite ?? null, new Date()]
+        datos.idTramite ?? null, datos.nombreTramite ?? null, datos.claveCotizacion ?? null, new Date()]
     );
     await conn.query('UPDATE ent_precotizaciones SET codigo = ? WHERE id = ?', [precotCode(res.insertId), res.insertId]);
     const [[row]] = await conn.query('SELECT * FROM ent_precotizaciones WHERE id = ?', [res.insertId]);
@@ -690,6 +732,9 @@ module.exports = {
   recordPayment,
   registerLead,
   setCrmLeadId,
+  setLeadDatos,
+  setUltimaCotizacion,
+  getUltimaCotizacion,
   createPrecotizacion,
   getPrecotizaciones,
   getPrecotizacionByCodigo,

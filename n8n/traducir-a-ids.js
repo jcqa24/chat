@@ -5,7 +5,8 @@
 
 const SIGEV_URL = 'https://my.grupogevhe.com'; // ← URL de SIGEV, sin "/" al final
 
-const entrada = $input.first().json;
+// Los datos se leen del trigger (no de $input): así da igual qué nodos haya en medio (p. ej. "Configuración").
+const entrada = $('Cuando lo llama el agente').first().json;
 
 const norm = (s) => String(s ?? '')
   .normalize('NFD').replace(/[̀-ͯ]/g, '')
@@ -72,6 +73,22 @@ const buscarTramite = (valor) => {
   for (const [a, b, id] of REGLAS_TRAMITE) if (a.test(v) && b.test(v)) return id;
   const conDe = Object.keys(TRAMITES).find((k) => k.length > 5 && norm(k.replace(/ DE /g, ' ')) === corto);
   return conDe ? TRAMITES[conDe] : null;
+};
+// Nombre oficial de cada trámite (cat_tramite.tramite_nombre en SIGEV): se guarda en la precotización.
+const NOMBRE_OFICIAL = {
+  3: 'Vehículo de otra entidad', 4: 'Baja y alta de placas', 5: 'Reemplacamiento', 6: 'Baja de placas',
+  7: 'Alta de placas', 8: 'Vehículo nuevo', 9: 'Renovación de tarjeta', 10: 'Cambio de propietario',
+  11: 'Reposición de tarjeta', 12: 'Situación crítica', 13: 'Corrección en sistema',
+  14: 'Reimpresión de registro de trámite', 15: 'Alta de serie en REPUVE', 16: 'Investigación de placa',
+  17: 'Verificación vehicular', 18: 'Licencia de manejo', 19: 'Permiso de carga',
+  20: 'Permiso para circular sin placas', 21: 'Desbloqueo', 22: 'Conclusión de trámite en delegación',
+  23: 'Refacturación de vehículo', 24: 'Factura de origen', 25: 'Constancia de extravío o robo',
+  26: 'Validación de pagos gubernamentales', 27: 'Aviso de venta portal', 29: 'Vehículo extranjero',
+  30: 'Reposición de licencia vigente', 31: 'Línea de captura de multas', 33: 'Borrón y cuenta nueva',
+  34: 'Actualización de placa activa por error', 35: 'Activación de placa', 38: 'Permiso de carga EDOMEX',
+  40: 'Reimpresión de tarjeta de circulación', 42: 'Certificado de manejo para moto',
+  43: 'Permiso de conducir para menor', 44: 'Licencia de manejo sin constancia',
+  45: 'Alta de placas edición especial', 46: 'Constancia de extravío',
 };
 const NOMBRES_TRAMITE = Object.keys(TRAMITES).filter((k) => k.includes(' ') || k.length > 7).join(', ');
 
@@ -148,9 +165,27 @@ const servicioIndicado = Boolean(idServicio);
 if (!servicioIndicado && norm(entrada.servicio)) faltan.push(`servicio VIP, XP o CL (no reconozco "${entrada.servicio}")`);
 
 const body = { id_tramite: idTramite, id_tipovehiculo: idVehiculo, id_entidad: idEntidad, id_tiposervicio: idServicio || 1 };
+// Valores "id-ALIAS" con los que SIGEV crea la cotización (cat_tramite.tramite_alias, cat_tipovehiculo,
+// cat_entidad.entidad_abreviatura). El servicio lo agrega "Respuesta para el agente" (puede cambiar).
+const ALIAS_TRAMITE = {
+  3: 'VOE', 4: 'BYA', 5: 'REE', 6: 'BAJA', 7: 'ALTA', 8: 'NVO', 9: 'RENOV', 10: 'CAMPRO', 11: 'REPTAR',
+  12: 'SITCRIT', 13: 'ACLARACIÓN', 14: 'CRC', 15: 'RPV', 16: 'INVEPL', 17: 'VERI', 18: 'LICEN', 19: 'ANTRA',
+  20: 'PERMI', 21: 'DESBLOQ', 22: 'CONCLU', 23: 'REFAC', 24: 'FACO', 25: 'ACTA', 26: 'CERTIPG', 27: 'VENTA',
+  29: 'EXT', 30: 'REPLICEN', 31: 'LINEA', 33: 'BORRON', 34: 'ACTUALIZACION', 35: 'ACTIVACION',
+  38: 'PERMICARGA', 40: 'REIMP', 42: 'CONSTANCIA', 43: 'LICENMNR', 44: 'LICENSC', 45: 'MUNDIAL', 46: 'CONSTANCIA EXT',
+};
+const ALIAS_VEHICULO = { 1: 'AUTO', 2: 'MOTO', 3: 'CARGA', 4: 'HIBRI', 5: 'REMOL', 6: 'DISCA', 7: 'CLASI', 8: 'AUTO/MOTO', 9: 'ELEC' };
+const conAlias = (id, alias) => (id && alias ? `${id}-${alias}` : null);
+
 const resumen = {
-  tramite: entrada.tramite, estado: entrada.estado, vehiculo: entrada.vehiculo,
+  tramite: entrada.tramite, id_tramite: idTramite, nombre_tramite: NOMBRE_OFICIAL[idTramite] ?? null,
+  estado: entrada.estado, vehiculo: entrada.vehiculo,
   servicio: servicioIndicado ? entrada.servicio : 'sin indicar', servicioIndicado,
+  sigev: {
+    tipo_tramite: conAlias(idTramite, ALIAS_TRAMITE[idTramite]),
+    tipo_vehiculo: conAlias(idVehiculo, ALIAS_VEHICULO[idVehiculo]),
+    entidad: conAlias(idEntidad, ESTADOS.find(([id]) => id === idEntidad)?.[1]),
+  },
 };
 
 if (TRAMITES_CON_VIGENCIA.includes(idTramite)) {
@@ -167,6 +202,7 @@ if (idTramite === TRAMITE_VERIFICACION) {
   body.id_modelo = modelo.id;
   body.voluntaria = esVerdadero(entrada.voluntaria);
   resumen.anio = modelo.anio;
+  resumen.sigev.modelo = conAlias(modelo.id, modelo.anio);
   resumen.voluntaria = body.voluntaria;
 }
 
