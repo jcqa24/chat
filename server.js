@@ -155,6 +155,36 @@ function scheduleAutoTyping(conversationId) {
   );
 }
 
+// Saludo de bienvenida: la página carga primero, luego "escribiendo..." unos segundos y después el mensaje.
+// Si el cliente recarga antes de que llegue, no se duplica (saludosEnCurso) y se manda una sola vez.
+const SALUDO_PAUSA_MS = 600; // deja que la página termine de cargar antes de "escribiendo..."
+const SALUDO_ESCRIBIENDO_MS = Number(process.env.GREETING_TYPING_MS) || 2000;
+const saludosEnCurso = new Set();
+async function enviarSaludo(conversation) {
+  if (!GREETING_MESSAGE || saludosEnCurso.has(conversation.id)) return;
+  saludosEnCurso.add(conversation.id);
+  const espera = (ms) => new Promise((r) => setTimeout(r, ms));
+  try {
+    await espera(SALUDO_PAUSA_MS);
+    io.to(room(conversation.id)).emit('typing', { typing: true });
+    await espera(SALUDO_ESCRIBIENDO_MS);
+    // Por si mientras tanto ya llegó otro mensaje de la influencer (p. ej. respuesta de n8n)
+    const actuales = await db.getMessages(conversation.id);
+    if (actuales.some((m) => m.sender === 'influencer')) return;
+    const msg = await db.insertMessage({
+      conversationId: conversation.id, sender: 'influencer', type: 'text', content: GREETING_MESSAGE,
+    });
+    const now = new Date();
+    await db.touchInfluencer(conversation.influencer_id, now);
+    io.to(room(conversation.id)).emit('message', msg);
+    io.to(room(conversation.id)).emit('presence', { lastSeen: now.toISOString() });
+  } catch (err) {
+    console.error(`Error enviando el saludo de la conversación ${conversation.id}:`, err);
+  } finally {
+    saludosEnCurso.delete(conversation.id);
+  }
+}
+
 function cancelAutoTyping(conversationId) {
   clearTimeout(typingTimers.get(conversationId));
   typingTimers.delete(conversationId);
@@ -894,10 +924,7 @@ io.use(async (socket, next) => {
     });
     if (created) {
       await db.insertMessage({ conversationId: conversation.id, sender: 'system', type: 'system', content: 'accepted' });
-      // La influencer saluda primero, sin esperar a que el cliente escriba
-      if (GREETING_MESSAGE) {
-        await db.insertMessage({ conversationId: conversation.id, sender: 'influencer', type: 'text', content: GREETING_MESSAGE });
-      }
+      // El saludo de la influencer NO va aquí: se manda al conectarse (ver enviarSaludo)
     }
 
     socket.data.client = client;
@@ -921,6 +948,8 @@ io.on('connection', async (socket) => {
       contact: { ...publicInfluencer(influencer), online: false },
       messages,
     });
+    // Conversación sin mensajes todavía: la influencer saluda primero
+    if (!messages.some((m) => m.sender !== 'system')) void enviarSaludo(conversation);
   } catch (err) {
     console.error('Error cargando conversación:', err);
     socket.emit('fatal', 'No se pudo cargar la conversación');
