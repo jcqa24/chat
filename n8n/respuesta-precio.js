@@ -3,8 +3,8 @@
 // Si no hay precio con el servicio pedido, consulta los otros servicios (VIP, XP, CL) para ofrecérselos al cliente.
 //
 // Flujo: Sandra da el precio y pregunta "¿Te gustaría avanzar con eso?". El precio se registra en el chat
-// (POST /api/conversations/:id/cotizacion) para cuando el cliente responda con la herramienta
-// respuesta_cotizacion. Aquí ya NO se guarda la precotización ni se manda ningún código.
+// (POST /api/conversations/:id/cotizacion) y el servidor del chat resuelve la respuesta del cliente
+// (sí / no / nombre y correo). Aquí ya NO se guarda la precotización ni se manda ningún código.
 
 // Qué incluye cada servicio (descripciones de cat_tiposervicio en SIGEV).
 const SERVICIOS = {
@@ -28,7 +28,7 @@ const AL_DAR_PRECIO = ' Da el precio UNA sola vez, en un solo mensaje, aclarando
   + ' Menciona el servicio solo por su nombre: NO expliques qué incluye ni en qué se diferencia de los otros, salvo que el cliente lo pregunte (entonces usa diferencias_servicios).'
   + ' No escribas ningún código.'
   + ' Termina preguntando: "¿Te gustaría avanzar con eso?".'
-  + ' Cuando el cliente responda que sí o que no, llama a respuesta_cotizacion con acepta true o false.';
+  + ' NO digas nada de asesores, códigos, la app ni de los siguientes pasos: cuando el cliente conteste, el sistema se encarga.';
 
 const respuesta = $input.first().json;
 const { resumen, body, sigevUrl } = $('Traducir a IDs').first().json;

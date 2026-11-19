@@ -5,7 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "conversar": "node pruebas/conversar.js"
   },
   "license": "UNLICENSED",
   "private": true,
@@ -15,5 +16,9 @@
     "multer": "^2.5.0",
     "mysql2": "^3.24.6",
     "socket.io": "^4.8.4"
+  },
+  "devDependencies": {
+    "playwright": "^1.65.1",
+    "socket.io-client": "4.8"
   }
 }

@@ -158,7 +158,7 @@ function scheduleAutoTyping(conversationId) {
 // Saludo de bienvenida: la página carga primero, luego "escribiendo..." unos segundos y después el mensaje.
 // Si el cliente recarga antes de que llegue, no se duplica (saludosEnCurso) y se manda una sola vez.
 const SALUDO_PAUSA_MS = 600; // deja que la página termine de cargar antes de "escribiendo..."
-const SALUDO_ESCRIBIENDO_MS = Number(process.env.GREETING_TYPING_MS) || 2000;
+const SALUDO_ESCRIBIENDO_MS = Number(process.env.GREETING_TYPING_MS) || 3000;
 const saludosEnCurso = new Set();
 async function enviarSaludo(conversation) {
   if (!GREETING_MESSAGE || saludosEnCurso.has(conversation.id)) return;
@@ -431,27 +431,41 @@ const mensajeCodigoTramite = (clave, correo) =>
   `Correo electrónico: ${correo}\nContraseña: ${clave}`;
 
 // Mensaje de la influencer generado por el servidor (no por n8n)
-async function sendInfluencerMessage(conversation, content) {
+async function sendInfluencerMessage(conversation, content, { seguirEscribiendo = true } = {}) {
   const msg = await db.insertMessage({ conversationId: conversation.id, sender: 'influencer', type: 'text', content });
   const now = new Date();
   await db.touchInfluencer(conversation.influencer_id, now);
   io.to(room(conversation.id)).emit('message', msg);
   io.to(room(conversation.id)).emit('presence', { lastSeen: now.toISOString() });
-  // Sandra sigue "escribiendo" el precio que n8n manda enseguida
-  io.to(room(conversation.id)).emit('typing', { typing: true });
+  // Si después contesta n8n, Sandra sigue "escribiendo"; si no (flujo del servidor), se apaga
+  io.to(room(conversation.id)).emit('typing', { typing: seguirEscribiendo });
   return msg;
 }
 
 // ---------- Flujo de cotización del chat ----------
-// 1) n8n (cotizar_tramite) da el precio y lo registra aquí → POST .../cotizacion
-// 2) El cliente responde si quiere avanzar          → POST .../respuesta-cotizacion { acepta }
-//    No: su lead regresa a la primera columna de Comercial.
-//    Sí, sin costo fijo (más impuestos): precotización PRE + "un asesor te contactará".
-//    Sí, con costo fijo: Sandra pide nombre y correo.
-// 3) Con nombre y correo                            → POST .../generar-cotizacion { nombre, correo }
-//    Se crea la cotización en SIGEV (COTA…) y el cliente recibe su código para entrar a la app.
+// El servidor lleva el paso de cada conversación en ultima_cotizacion.estado:
+//   esperando_respuesta → Sandra dio un precio y preguntó "¿Te gustaría avanzar con eso?"
+//   esperando_datos     → aceptó un trámite de costo fijo: faltan nombre y correo
+//   terminada           → ya se respondió (rechazó, recibió su PRE o su código de trámite)
+//
+// Cómo avanza:
+// 1) n8n (cotizar_tramite) registra el precio → POST .../cotizacion          (estado esperando_respuesta)
+// 2) El siguiente mensaje del cliente lo revisa el servidor (manejarFlujo): un "sí" o un "no" claros,
+//    o el nombre y el correo, los resuelve el servidor sin pasar por la IA. Lo demás va a Sandra.
+//    - No: su lead regresa a la primera columna de Comercial.
+//    - Sí, sin costo fijo (más impuestos): precotización PRE + "un asesor te contactará".
+//    - Sí, con costo fijo: se piden nombre y correo; con ellos se crea la cotización en SIGEV (COTA…).
+// Las herramientas de n8n respuesta_cotizacion / generar_cotizacion hacen lo mismo (opcionales).
 
 const ahora = () => new Date().toISOString();
+const esperaMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const MENSAJE_PIDE_DATOS =
+  '¡Perfecto! 🙌 Para generar tu trámite necesito tu nombre completo y tu correo electrónico (con ese correo entrarás a la app).';
+const MENSAJE_PIDE_NOMBRE = '¡Gracias! ¿Y tu nombre completo?';
+const mensajePideCorreo = (nombre) =>
+  `¡Gracias, ${nombre.split(' ')[0]}! ¿Me compartes tu correo electrónico? Con él entrarás a la app 📲`;
+const MENSAJE_RECHAZO = '¡Claro! Aquí estoy si cambias de opinión o necesitas otro trámite 😊';
 
 // Último precio que se le dio al cliente. Todavía NO es precotización (no va a ent_precotizaciones).
 app.post('/api/conversations/:conversationId/cotizacion', requireApiKey, async (req, res) => {
@@ -460,11 +474,15 @@ app.post('/api/conversations/:conversationId/cotizacion', requireApiKey, async (
   const datos = leerDatosCotizacion(req.body || {});
   if (datos.error) return res.status(400).json({ error: datos.error });
   // Costo fijo = SIGEV no le suma impuestos (mas_impuestos = 0)
-  const cotizacion = { ...datos, costoFijo: !datos.masImpuestos, aceptada: null, cotizadaAt: ahora() };
+  const cotizacion = {
+    ...datos, costoFijo: !datos.masImpuestos, aceptada: null, estado: 'esperando_respuesta', cotizadaAt: ahora(),
+  };
   await db.setUltimaCotizacion(conversation.id, cotizacion);
   res.json({ ok: true, costo_fijo: cotizacion.costoFijo, cotizacion });
 });
 
+// Las respuestas de "no se puede" van con 200 y ok:false: el HTTP Request Tool de n8n trata 4xx como
+// error y el agente no leería el mensaje (diría "problema técnico").
 app.post('/api/conversations/:conversationId/respuesta-cotizacion', requireApiKey, async (req, res) => {
   const conversation = await findConversation(req.params.conversationId);
   if (!conversation) return res.status(404).json({ error: 'Conversación no encontrada' });
@@ -473,127 +491,253 @@ app.post('/api/conversations/:conversationId/respuesta-cotizacion', requireApiKe
   let acepta = null;
   if (['true', 'si', 'sí', '1'].includes(valor)) acepta = true;
   else if (['false', 'no', '0'].includes(valor)) acepta = false;
-  if (acepta === null) return res.status(400).json({ error: 'acepta debe ser true o false' });
-
-  const cotizacion = db.getUltimaCotizacion(conversation);
-  if (!cotizacion) {
-    return res.status(409).json({
+  if (acepta === null) {
+    return res.json({
       ok: false,
-      mensaje: 'Todavía no le has dado un precio a este cliente. Pregúntale qué trámite necesita y usa cotizar_tramite.',
+      mensaje: 'No quedó claro si el cliente quiere avanzar. Pregúntale de nuevo y vuelve a llamar a respuesta_cotizacion con acepta true o false.',
     });
   }
-
-  await db.setUltimaCotizacion(conversation.id, { ...cotizacion, aceptada: acepta, respondidaAt: ahora() });
-
-  if (!acepta) {
-    const crm = await actualizarLeadEnCrm(conversation, { primera_columna: true });
-    return res.json({
-      ok: true,
-      acepta,
-      crm,
-      mensaje: 'El cliente no quiere avanzar. Respóndele breve y amable que aquí estás si cambia de opinión o necesita otro trámite. No insistas ni repitas el precio.',
-    });
-  }
-
-  if (cotizacion.costoFijo) {
-    return res.json({
-      ok: true,
-      acepta,
-      costo_fijo: true,
-      mensaje: 'El cliente quiere avanzar y el trámite tiene costo fijo. Pídele en un solo mensaje su nombre completo y su correo electrónico (con ese correo entrará a la app). Cuando te los dé, llama a generar_cotizacion con nombre y correo. No le des ningún código todavía.',
-    });
-  }
-
-  const { codigo, nueva } = await enviarPrecotizacion(conversation, cotizacion);
-  res.json({
-    ok: true,
-    acepta,
-    costo_fijo: false,
-    codigo,
-    nueva,
-    mensaje: nueva
-      ? `El cliente YA recibió en mensajes aparte que un asesor lo contactará por la app y su código de precotización (${codigo}) con los links de la app. NO repitas el código, los links ni el precio. Responde solo una frase corta de cierre, por ejemplo: "¿Te puedo ayudar con algo más? 😊".`
-      : `El cliente ya tenía su código de precotización (${codigo}) y los links de la app. NO los repitas: responde solo a lo último que dijo.`,
-  });
+  res.json(await enFila(conversation.id, () => responderCotizacion(conversation, acepta, { porServidor: false })));
 });
 
 app.post('/api/conversations/:conversationId/generar-cotizacion', requireApiKey, async (req, res) => {
   const conversation = await findConversation(req.params.conversationId);
   if (!conversation) return res.status(404).json({ error: 'Conversación no encontrada' });
-
   const nombre = String(req.body?.nombre ?? '').replace(/\s+/g, ' ').trim();
   const correo = String(req.body?.correo ?? '').trim().toLowerCase();
-  if (nombre.length < 2 || nombre.length > 100) {
-    return res.status(400).json({ ok: false, mensaje: 'Falta el nombre completo del cliente: pídeselo.' });
-  }
-  if (correo.length > 150 || !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(correo)) {
-    return res.status(400).json({ ok: false, mensaje: `El correo "${correo}" no es válido: pídeselo de nuevo al cliente.` });
+  res.json(await enFila(conversation.id, () => generarCotizacion(conversation, nombre, correo, { porServidor: false })));
+});
+
+// Una cosa a la vez por conversación (dos mensajes seguidos del cliente no generan dos cotizaciones)
+const filas = new Map();
+function enFila(conversationId, tarea) {
+  const anterior = filas.get(conversationId) ?? Promise.resolve();
+  const actual = anterior.catch(() => {}).then(tarea);
+  filas.set(conversationId, actual);
+  actual.finally(() => { if (filas.get(conversationId) === actual) filas.delete(conversationId); }).catch(() => {});
+  return actual;
+}
+
+// Mensaje del servidor con "escribiendo..." antes, como si lo escribiera Sandra
+async function escribirComoSandra(conversation, texto, ms = 1200) {
+  io.to(room(conversation.id)).emit('typing', { typing: true });
+  await esperaMs(ms);
+  return sendInfluencerMessage(conversation, texto, { seguirEscribiendo: false });
+}
+
+/**
+ * El cliente dijo sí o no al precio. porServidor: el servidor escribe los mensajes (flujo automático);
+ * si no, los escribe el agente de n8n con el "mensaje" que se le devuelve.
+ */
+async function responderCotizacion(conversation, acepta, { porServidor }) {
+  const conv = (await db.getConversation(conversation.id)) ?? conversation;
+  const cotizacion = db.getUltimaCotizacion(conv);
+  if (!cotizacion) {
+    return { ok: false, mensaje: 'Todavía no le has dado un precio a este cliente. Pregúntale qué trámite necesita y usa cotizar_tramite.' };
   }
 
-  const cotizacion = db.getUltimaCotizacion(conversation);
-  if (!cotizacion || cotizacion.aceptada !== true || !cotizacion.costoFijo) {
-    return res.status(409).json({
-      ok: false,
-      mensaje: 'Solo se genera cuando el cliente aceptó un precio de costo fijo. Usa primero cotizar_tramite y respuesta_cotizacion.',
-    });
+  if (!acepta) {
+    await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: false, estado: 'terminada', respondidaAt: ahora() });
+    const crm = await actualizarLeadEnCrm(conv, { primera_columna: true });
+    if (porServidor) await escribirComoSandra(conv, MENSAJE_RECHAZO);
+    return {
+      ok: true, acepta, crm,
+      mensaje: 'El cliente no quiere avanzar. Respóndele breve y amable que aquí estás si cambia de opinión o necesita otro trámite. No insistas ni repitas el precio.',
+    };
+  }
+
+  if (cotizacion.costoFijo) {
+    if (cotizacion.claveCotizacion) {
+      return { ok: true, acepta, costo_fijo: true, mensaje: `El cliente ya tiene su código (${cotizacion.claveCotizacion}). NO lo repitas: responde solo a lo último que dijo.` };
+    }
+    await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: true, estado: 'esperando_datos', respondidaAt: ahora() });
+    if (porServidor) await escribirComoSandra(conv, MENSAJE_PIDE_DATOS);
+    return {
+      ok: true, acepta, costo_fijo: true,
+      mensaje: 'El cliente quiere avanzar y el trámite tiene costo fijo. Pídele en un solo mensaje su nombre completo y su correo electrónico (con ese correo entrará a la app). Cuando te los dé, llama a generar_cotizacion con nombre y correo. No le des ningún código todavía.',
+    };
+  }
+
+  await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: true, estado: 'terminada', respondidaAt: ahora() });
+  const { codigo, nueva } = await enviarPrecotizacion(conv, cotizacion, { porServidor });
+  return {
+    ok: true, acepta, costo_fijo: false, codigo, nueva,
+    mensaje: nueva
+      ? `El cliente YA recibió en mensajes aparte que un asesor lo contactará por la app y su código de precotización (${codigo}) con los links de la app. NO repitas el código, los links ni el precio. Responde solo una frase corta de cierre, por ejemplo: "¿Te puedo ayudar con algo más? 😊".`
+      : `El cliente ya tenía su código de precotización (${codigo}) y los links de la app. NO los repitas: responde solo a lo último que dijo.`,
+  };
+}
+
+const CORREO_VALIDO_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+/** Con nombre y correo (costo fijo): crea la cotización en SIGEV y le manda al cliente su código. */
+async function generarCotizacion(conversation, nombre, correo, { porServidor }) {
+  if (nombre.length < 2 || nombre.length > 100) return { ok: false, mensaje: 'Falta el nombre completo del cliente: pídeselo.' };
+  if (correo.length > 150 || !CORREO_VALIDO_RE.test(correo)) {
+    return { ok: false, mensaje: `El correo "${correo}" no es válido: pídeselo de nuevo al cliente.` };
+  }
+
+  const conv = (await db.getConversation(conversation.id)) ?? conversation;
+  const cotizacion = db.getUltimaCotizacion(conv);
+  if (!cotizacion) {
+    return { ok: false, mensaje: 'Todavía no le has dado un precio a este cliente. Pregúntale qué trámite necesita y usa cotizar_tramite.' };
+  }
+  if (!cotizacion.costoFijo) {
+    return { ok: false, mensaje: 'Este trámite no es de costo fijo: no se genera código de trámite. Llama a respuesta_cotizacion con acepta true y sigue su mensaje.' };
+  }
+  if (cotizacion.aceptada === false) {
+    return { ok: false, mensaje: 'El cliente había dicho que no quería avanzar. Confírmale si ahora sí quiere y llama a respuesta_cotizacion con acepta true.' };
   }
   if (cotizacion.claveCotizacion) {
-    return res.json({
-      ok: true,
-      clave: cotizacion.claveCotizacion,
-      nueva: false,
+    return {
+      ok: true, clave: cotizacion.claveCotizacion, nueva: false,
       mensaje: `El cliente ya tiene su código (${cotizacion.claveCotizacion}) y las instrucciones de la app. NO los repitas: responde solo a lo último que dijo.`,
-    });
+    };
   }
 
-  await db.setLeadDatos(conversation.id, nombre, correo);
-  const crm = await actualizarLeadEnCrm({ ...conversation, lead_name: nombre }, { nombre, correo });
+  // Dar nombre y correo ya es aceptar la cotización (por si el agente se saltó respuesta_cotizacion)
+  await db.setUltimaCotizacion(conv.id, {
+    ...cotizacion, aceptada: true, estado: 'esperando_datos', nombre, correo, respondidaAt: cotizacion.respondidaAt ?? ahora(),
+  });
+  await db.setLeadDatos(conv.id, nombre, correo);
+  const crm = await actualizarLeadEnCrm({ ...conv, lead_name: nombre }, { nombre, correo });
 
+  if (porServidor) io.to(room(conv.id)).emit('typing', { typing: true }); // SIGEV tarda unos segundos
   let clave = null;
   let errorSigev = null;
   try {
     clave = await crearCotizacionSigev(cotizacion, nombre, correo);
   } catch (err) {
     errorSigev = err.message;
-    console.error(`SIGEV: no se generó la cotización de la conversación ${conversation.id}: ${err.message}`);
+    console.error(`SIGEV: no se generó la cotización de la conversación ${conv.id}: ${err.message}`);
   }
 
   if (!clave) {
     // Sin SIGEV no hay código para la app: sigue como precotización y lo atiende un asesor
-    const { codigo } = await enviarPrecotizacion(conversation, cotizacion);
-    return res.json({
-      ok: true,
-      sigev: false,
-      error_sigev: errorSigev,
-      codigo,
-      crm,
+    await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: true, estado: 'terminada', nombre, correo, errorSigev });
+    const { codigo } = await enviarPrecotizacion(conv, cotizacion, { porServidor });
+    return {
+      ok: true, sigev: false, error_sigev: errorSigev, codigo, crm,
       mensaje: `No se pudo generar el trámite; el cliente YA recibió que un asesor lo contactará por la app y su código de precotización (${codigo}). NO repitas el código ni los links. Responde solo una frase corta de cierre.`,
-    });
+    };
   }
 
-  await db.setUltimaCotizacion(conversation.id, { ...cotizacion, claveCotizacion: clave, nombre, correo, generadaAt: ahora() });
-  const { precotizacion } = await db.createPrecotizacion(conversation, { ...cotizacion, claveCotizacion: clave });
-  await sendInfluencerMessage(conversation, mensajeCodigoTramite(clave, correo));
-
-  res.json({
-    ok: true,
-    sigev: true,
-    clave,
-    codigo: precotizacion.codigo,
-    crm,
-    mensaje: `El cliente YA recibió en un mensaje aparte el código de su trámite (${clave}), los links de la app y cómo iniciar sesión. NO repitas el código, los links ni las instrucciones. Responde solo una frase corta de cierre, por ejemplo: "¡Listo! Cualquier duda aquí estoy 😊".`,
+  await db.setUltimaCotizacion(conv.id, {
+    ...cotizacion, aceptada: true, estado: 'terminada', claveCotizacion: clave, nombre, correo, generadaAt: ahora(),
   });
-});
+  const { precotizacion } = await db.createPrecotizacion(conv, { ...cotizacion, claveCotizacion: clave });
+  await sendInfluencerMessage(conv, mensajeCodigoTramite(clave, correo), { seguirEscribiendo: !porServidor });
+
+  return {
+    ok: true, sigev: true, clave, codigo: precotizacion.codigo, crm,
+    mensaje: `El cliente YA recibió en un mensaje aparte el código de su trámite (${clave}), los links de la app y cómo iniciar sesión. NO repitas el código, los links ni las instrucciones. Responde solo una frase corta de cierre, por ejemplo: "¡Listo! Cualquier duda aquí estoy 😊".`,
+  };
+}
 
 // Guarda la precotización (PRE…) y manda "un asesor te contactará" + el código con los links de la app
-async function enviarPrecotizacion(conversation, cotizacion) {
+async function enviarPrecotizacion(conversation, cotizacion, { porServidor = false } = {}) {
   const { precotizacion, created } = await db.createPrecotizacion(conversation, cotizacion);
   if (created) {
-    await sendInfluencerMessage(conversation, MENSAJE_ASESOR);
-    await new Promise((r) => setTimeout(r, SPLIT_DELAY_MS));
-    await sendInfluencerMessage(conversation, mensajeCodigoApp(precotizacion.codigo));
+    if (porServidor) {
+      await escribirComoSandra(conversation, MENSAJE_ASESOR);
+    } else {
+      await sendInfluencerMessage(conversation, MENSAJE_ASESOR);
+    }
+    await esperaMs(SPLIT_DELAY_MS);
+    await sendInfluencerMessage(conversation, mensajeCodigoApp(precotizacion.codigo), { seguirEscribiendo: !porServidor });
   }
   return { codigo: precotizacion.codigo, nueva: created };
+}
+
+// ---------- Respuestas del cliente que resuelve el servidor (sin IA) ----------
+
+// Minúsculas, sin acentos, sin signos ni emojis: "¡Sí, claro! 👍" → "si claro"
+const normalizarTexto = (t) => String(t ?? '')
+  .toLowerCase()
+  .normalize('NFD').replace(/[̀-ͯ]/g, '')
+  .replace(/[^a-z0-9ñ\s]/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+// Todas las palabras del mensaje deben estar en la lista y al menos una debe ser "fuerte".
+// Así "sí, quiero continuar" es un sí, pero "quiero otra licencia para auto" no (va a Sandra).
+const palabras = (s) => new Set(s.split(' '));
+const SI_FUERTES = palabras('si sii siii sip simon sale va vale claro dale orale andale ok okay okey oki perfecto adelante quiero interesa acuerdo listo hagamoslo avanzar avancemos avanzamos continuar continuemos seguir sigamos correcto supuesto obvio gustaria bueno venga excelente genial super bien');
+const SI_RELLENO = palabras('me de por favor porfa porfavor esta bien parece con eso el la lo tramite gracias hacerlo quisiera deseo ya pues muy y entonces vamos que esta');
+const NO_FUERTES = palabras('no nop nel nah luego despues pienso pensar pensarlo pensare paso');
+const NO_RELLENO = palabras('gracias ahorita ahora por el momento todavia aun mas tarde lo voy a dejame me interesa mejor quiero muchas de nada asi');
+
+/** "si" | "no" | null (no está claro: lo decide Sandra) */
+function clasificarRespuesta(texto) {
+  if (/\?/.test(texto)) return null; // una pregunta la contesta Sandra
+  const t = normalizarTexto(texto);
+  if (!t) return null;
+  const ws = t.split(' ');
+  if (ws.length > 8) return null;
+  if (/^no se\b/.test(t)) return null; // "no sé" no es un no
+  const todasEn = (fuertes, relleno) => ws.every((w) => fuertes.has(w) || relleno.has(w)) && ws.some((w) => fuertes.has(w));
+  if (todasEn(NO_FUERTES, NO_RELLENO)) return 'no';
+  if (!ws.includes('no') && todasEn(SI_FUERTES, SI_RELLENO)) return 'si';
+  return null;
+}
+
+const CORREO_EN_TEXTO_RE = /[^\s@,;:<>()"']+@[^\s@,;:<>()"']+\.[a-z]{2,}/i;
+const RELLENO_NOMBRE_RE = /(^|\s)(mi nombre completo es|mi nombre es|me llamo|nombre completo|nombre|soy|mis datos son|mis datos|datos|mi correo es|mi correo|correo electr[oó]nico|electr[oó]nico|correo|e-?mail|mail|aqu[ií] est[aá]n?|te paso|y es|es|y|hola|gracias|listo|claro|ok|va)(?=\s|$|[,.:;!])/gi;
+
+/** Busca correo y nombre en lo que escribió el cliente: { correo, nombre } (cada uno puede ser null) */
+function extraerDatos(texto) {
+  const correoEncontrado = String(texto).match(CORREO_EN_TEXTO_RE)?.[0]?.toLowerCase().replace(/\.$/, '') ?? null;
+  const correo = correoEncontrado && CORREO_VALIDO_RE.test(correoEncontrado) ? correoEncontrado : null;
+  let nombre = null;
+  if (!/\?/.test(texto)) {
+    const resto = String(texto)
+      .replace(CORREO_EN_TEXTO_RE, ' ')
+      .normalize('NFC')
+      .replace(RELLENO_NOMBRE_RE, ' ')
+      .replace(/[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ' ]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const partes = resto.split(' ').filter(Boolean);
+    // Un nombre completo: de 2 a 6 palabras (con una sola palabra puede ser "ok", "va"...)
+    if (partes.length >= 2 && partes.length <= 6 && clasificarRespuesta(resto) === null) {
+      nombre = partes.map((p) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()).join(' ');
+    }
+  }
+  return { correo, nombre };
+}
+
+/**
+ * Revisa el mensaje del cliente según el paso de su conversación. Devuelve true si el servidor lo
+ * resolvió (no se manda a n8n) o false si debe contestarlo Sandra.
+ */
+async function manejarFlujo(conversationId, texto) {
+  const conv = await db.getConversation(conversationId);
+  const cotizacion = conv && db.getUltimaCotizacion(conv);
+  if (!cotizacion) return false;
+
+  if (cotizacion.estado === 'esperando_respuesta') {
+    const respuesta = clasificarRespuesta(texto);
+    if (!respuesta) return false;
+    await responderCotizacion(conv, respuesta === 'si', { porServidor: true });
+    return true;
+  }
+
+  if (cotizacion.estado === 'esperando_datos') {
+    const encontrado = extraerDatos(texto);
+    const nombre = encontrado.nombre ?? cotizacion.nombre ?? null;
+    const correo = encontrado.correo ?? cotizacion.correo ?? null;
+    if (!encontrado.nombre && !encontrado.correo) return false; // una pregunta u otra cosa: Sandra
+    if (nombre && correo) {
+      await generarCotizacion(conv, nombre, correo, { porServidor: true });
+      return true;
+    }
+    // Falta uno de los dos: se guarda lo que dio y se pide lo otro
+    await db.setUltimaCotizacion(conv.id, { ...cotizacion, nombre, correo });
+    await escribirComoSandra(conv, nombre ? mensajePideCorreo(nombre) : MENSAJE_PIDE_NOMBRE);
+    return true;
+  }
+
+  return false;
 }
 
 // ---------- SIGEV ----------
@@ -971,8 +1115,20 @@ io.on('connection', async (socket) => {
       io.to(room(conversation.id)).emit('message', msg);
       reply({ ok: true, id: msg.id });
 
-      scheduleAutoTyping(conversation.id);
       void crearLeadWeb(conversation.id, client.name);
+
+      // Respuestas al precio ("sí", "no", nombre y correo) las resuelve el servidor sin pasar por la IA
+      if (type === 'text') {
+        let resuelto = false;
+        try {
+          resuelto = await enFila(conversation.id, () => manejarFlujo(conversation.id, norm.content));
+        } catch (err) {
+          console.error(`Error en el flujo de cotización de la conversación ${conversation.id}:`, err);
+        }
+        if (resuelto) return;
+      }
+
+      scheduleAutoTyping(conversation.id);
       void notifyN8n({
         event: 'message.received',
         conversationId: conversation.id,
