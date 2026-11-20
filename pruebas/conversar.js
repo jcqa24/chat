@@ -8,6 +8,15 @@
 //   npm run conversar -- lista
 //   npm run conversar -- licencia-acepta --navegador            (abre Chrome y escribe ahí, para verlo)
 //   npm run conversar -- licencia-acepta --navegador --celular  (igual, con pantalla de celular)
+//   npm run conversar -- precios --navegador --tramite 18       (precios de SIGEV: una conversación por precio)
+//   npm run conversar -- precios --tramite LICEN,VOE --estado EDOMEX
+//   npm run conversar -- tramites                                (tipos de trámite con precio, para --tramite)
+//
+// Al final se abre un reporte HTML con lo que pasó y falló (y cada conversación); --no-abrir para no abrirlo.
+//
+// Con --navegador la ventana se queda abierta hasta que la cierres y entonces sigue la siguiente
+// conversación (--sin-esperar: se cierra sola a los 4 s). Filtros de "precios": --tramite (id o alias),
+// --estado (id o alias) y --limite N. Necesita SIGEV_IA_EMAIL / SIGEV_IA_PASSWORD en .env.
 //
 // El link es un link de referido de cualquier influencer (como los que da el CRM). Se puede dejar
 // en .env como PRUEBAS_LINK. Cada corrida abre una conversación nueva (cliente "prueba-…").
@@ -17,6 +26,7 @@ require('dotenv').config({ quiet: true });
 const crypto = require('crypto');
 const { io } = require('socket.io-client');
 const ESCENARIOS = require('./escenarios');
+const { guardarReporte } = require('./reporte');
 
 const args = process.argv.slice(2);
 const opcion = (nombre, porDefecto) => {
@@ -29,6 +39,7 @@ const SILENCIO_MS = Number(opcion('silencio', 6000)); // sin mensajes nuevos est
 const MAX_ESPERA_MS = 90000;
 const NAVEGADOR = args.includes('--navegador');
 const CELULAR = args.includes('--celular');
+const ESPERAR_VENTANA = NAVEGADOR && !args.includes('--sin-esperar') && process.env.PRUEBAS_OCULTO !== '1';
 
 // Con --navegador se abre Chrome visible: el cliente escribe en la página real y tú ves la conversación.
 // Las revisiones se hacen igual, con una conexión aparte a la misma conversación.
@@ -45,6 +56,8 @@ async function abrirNavegador() {
   const browser = await playwright.chromium.launch({ headless: process.env.PRUEBAS_OCULTO === '1' });
   const contextoBase = CELULAR ? playwright.devices['iPhone 13'] : { viewport: { width: 1100, height: 800 } };
   navegador = { browser, contextoBase };
+  // Si cierras todo Chrome, la siguiente conversación abre uno nuevo
+  browser.once('disconnected', () => { navegador = null; });
   return navegador;
 }
 
@@ -53,12 +66,14 @@ const gris = (t) => color(90, t);
 const verde = (t) => color(32, t);
 const rojo = (t) => color(31, t);
 const azul = (t) => color(36, t);
+const amarillo = (t) => color(33, t);
 const negritas = (t) => color(1, t);
 const espera = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function uso(error) {
   if (error) console.error(rojo(error) + '\n');
-  console.log('Uso: npm run conversar -- <escenario|todos|lista> [--veces N] [--link URL] [--silencio ms]\n');
+  console.log('Uso: npm run conversar -- <escenario|todos|precios|tramites|lista> [--navegador] [--celular] [--veces N]');
+  console.log('       [--tramite LICEN,VOE] [--estado CDMX] [--limite N] [--link URL] [--sin-esperar] [--no-abrir]\n');
   console.log('Escenarios:');
   for (const [nombre, e] of Object.entries(ESCENARIOS)) console.log(`  ${nombre.padEnd(20)} ${gris(e.descripcion)}`);
   process.exit(error ? 1 : 0);
@@ -130,12 +145,21 @@ async function abrirChat(link) {
     enviar,
     esperarRespuesta,
     recibidos,
-    async cerrar() {
-      socket.close();
-      if (contexto) {
-        await espera(4000); // un momento para ver cómo quedó antes de cerrar
-        await contexto.close();
+    cerrar: () => socket.close(),
+    // Con navegador: la ventana se queda abierta hasta que tú la cierres (con --sin-esperar se cierra sola)
+    async cerrarVentana() {
+      if (!contexto) return;
+      if (ESPERAR_VENTANA) {
+        console.log(amarillo('  ⏸  Cierra la ventana del navegador para pasar a la siguiente conversación...'));
+        await new Promise((listo) => {
+          pagina.once('close', listo);
+          contexto.once('close', listo);
+          navegador?.browser.once('disconnected', listo);
+        });
+      } else {
+        await espera(4000);
       }
+      await contexto.close().catch(() => {});
     },
     get conversationId() { return conversationId; },
   };
@@ -151,12 +175,15 @@ async function correrEscenario(nombre, escenario, corrida) {
   const chat = await abrirChat(LINK);
   const ctx = { correo: `prueba+${Date.now().toString(36)}@example.com`, ultimoTurno: [] };
   const fallas = [];
+  const conversacion = []; // para el reporte
+  const revisadas = [];
   let revisiones = 0;
+  const anotar = (quien, texto) => { imprimir(quien, texto); conversacion.push({ quien, texto }); };
 
   try {
     // Saludo (puede tardar unos segundos en llegar)
     const saludo = await chat.esperarRespuesta(0);
-    saludo.forEach((m) => imprimir('sandra', m));
+    saludo.forEach((m) => anotar('sandra', m));
 
     for (const paso of escenario.pasos) {
       if (paso.soloSi && !paso.soloSi(ctx)) {
@@ -164,46 +191,66 @@ async function correrEscenario(nombre, escenario, corrida) {
         continue;
       }
       const texto = typeof paso.cliente === 'function' ? paso.cliente(ctx) : paso.cliente;
-      imprimir('cliente', texto);
+      anotar('cliente', texto);
       const turno = await chat.enviar(texto);
-      if (!turno.length) imprimir('sandra', rojo('(sin respuesta)'));
-      turno.forEach((m) => imprimir('sandra', m));
+      if (!turno.length) { imprimir('sandra', rojo('(sin respuesta)')); conversacion.push({ quien: 'sandra', texto: '(sin respuesta)' }); }
+      turno.forEach((m) => anotar('sandra', m));
       ctx.ultimoTurno = turno;
 
       for (const { que, re } of paso.debe ?? []) {
         revisiones++;
         const ok = turno.some((m) => re.test(m));
         console.log(`    ${ok ? verde('✔') : rojo('✘')} ${que}`);
+        revisadas.push({ que, ok });
         if (!ok) fallas.push(`"${texto}": ${que}`);
       }
       for (const { que, re } of paso.noDebe ?? []) {
         revisiones++;
         const ok = !turno.some((m) => re.test(m));
         console.log(`    ${ok ? verde('✔') : rojo('✘')} ${que}`);
+        revisadas.push({ que, ok });
         if (!ok) fallas.push(`"${texto}": ${que}`);
       }
     }
   } catch (err) {
     fallas.push(err.message);
+    revisadas.push({ que: `Error: ${err.message}`, ok: false });
     console.log(rojo(`  Error: ${err.message}`));
   } finally {
-    await chat.cerrar();
+    chat.cerrar();
   }
 
-  console.log(gris(`  Conversación #${chat.conversationId ?? '?'} · ${revisiones - fallas.length}/${revisiones} revisiones OK`));
-  return { nombre, fallas, conversationId: chat.conversationId };
+  const marca = fallas.length ? rojo('✘') : verde('✔');
+  console.log(`  ${marca} ${gris(`Conversación #${chat.conversationId ?? '?'} · ${revisiones - fallas.length}/${revisiones} revisiones OK`)}`);
+  await chat.cerrarVentana();
+  return { nombre, fallas, conversationId: chat.conversationId, conversacion, revisadas, tipo: escenario.tipo, descripcion: escenario.descripcion, corrida };
 }
 
 (async () => {
   const objetivo = args.find((a) => !a.startsWith('--') && !args[args.indexOf(a) - 1]?.startsWith('--'));
   if (!objetivo || objetivo === 'lista') uso();
+  if (objetivo === 'tramites') {
+    const { conectar, descargarCatalogo, imprimirTramites } = require('./sigev-catalogo');
+    const { sigev } = await conectar();
+    imprimirTramites((await descargarCatalogo(sigev)).filas);
+    process.exit(0);
+  }
   if (!LINK) uso('Falta el link del chat: usa --link https://…/CODIGO o pon PRUEBAS_LINK en .env');
-  const nombres = objetivo === 'todos' ? Object.keys(ESCENARIOS) : [objetivo];
-  for (const n of nombres) if (!ESCENARIOS[n]) uso(`No existe el escenario "${n}"`);
+
+  // "precios": un escenario por cada precio de SIGEV (filtrables con --tramite, --estado y --limite)
+  let escenarios = ESCENARIOS;
+  if (objetivo === 'precios') {
+    const { cargarEscenariosPrecios } = require('./escenarios-precios');
+    escenarios = await cargarEscenariosPrecios({ tramite: opcion('tramite'), estado: opcion('estado'), limite: opcion('limite') });
+    console.log(gris(`${Object.keys(escenarios).length} conversaciones de precios (una por combinación de SIGEV)`));
+    if (!Object.keys(escenarios).length) uso('No hay precios con esos filtros');
+  }
+  const nombres = ['todos', 'precios'].includes(objetivo) ? Object.keys(escenarios) : [objetivo];
+  for (const n of nombres) if (!escenarios[n]) uso(`No existe el escenario "${n}"`);
 
   const resultados = [];
   for (let corrida = 1; corrida <= VECES; corrida++) {
-    for (const n of nombres) resultados.push(await correrEscenario(n, ESCENARIOS[n], corrida));
+    for (const n of nombres) resultados.push(await correrEscenario(n, escenarios[n], corrida));
   }
 
   // Resumen
@@ -216,6 +263,27 @@ async function correrEscenario(nombre, escenario, corrida) {
     console.log(`  ${marca} ${n.padEnd(20)} ${bien}/${rs.length} corridas sin fallas`);
     for (const r of rs) for (const f of r.fallas) console.log(rojo(`      #${r.conversationId ?? '?'} ${f}`));
   }
-  if (navegador) await navegador.browser.close();
+  if (navegador) await navegador.browser.close().catch(() => {});
+
+  const reporte = guardarReporte({
+    nombre: objetivo === 'precios' ? 'conversaciones-precios' : 'conversaciones',
+    titulo: objetivo === 'precios' ? 'Conversaciones de precios con Sandra' : 'Conversaciones de prueba con Sandra',
+    subtitulo: `Chat ${new URL(LINK).origin} · ${VECES} corrida(s)${opcion('tramite') ? ` · trámite ${opcion('tramite')}` : ''}${opcion('estado') ? ` · estado ${opcion('estado')}` : ''}`,
+    resultados: resultados.map((r) => ({
+      tipo: r.tipo ?? r.nombre,
+      caso: `${r.nombre}${VECES > 1 ? ` (corrida ${r.corrida})` : ''} · conversación #${r.conversationId ?? '?'}`,
+      ok: !r.fallas.length,
+      esperado: r.descripcion,
+      obtenido: `${r.revisadas.filter((v) => v.ok).length}/${r.revisadas.length} revisiones`,
+      detalle: r.fallas.join(' | '),
+      revisiones: r.revisadas,
+      conversacion: r.conversacion,
+    })),
+    abrir: !args.includes('--no-abrir'),
+  });
+  console.log(gris(`\nReporte: ${reporte.html}\nCSV:     ${reporte.csv}`));
   process.exit(resultados.every((r) => !r.fallas.length) ? 0 : 1);
-})();
+})().catch((err) => {
+  console.error(rojo(err.message));
+  process.exit(1);
+});
