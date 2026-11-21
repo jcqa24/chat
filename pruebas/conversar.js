@@ -10,6 +10,7 @@
 //   npm run conversar -- licencia-acepta --navegador --celular  (igual, con pantalla de celular)
 //   npm run conversar -- precios --navegador --tramite 18       (precios de SIGEV: una conversación por precio)
 //   npm run conversar -- precios --tramite LICEN,VOE --estado EDOMEX
+//   npm run conversar -- precios --tramite VOE --directo        (todo en un mensaje; sin --directo platica paso a paso)
 //   npm run conversar -- tramites                                (tipos de trámite con precio, para --tramite)
 //
 // Al final se abre un reporte HTML con lo que pasó y falló (y cada conversación); --no-abrir para no abrirlo.
@@ -37,6 +38,7 @@ const LINK = opcion('link', process.env.PRUEBAS_LINK);
 const VECES = Math.max(1, Number(opcion('veces', 1)) || 1);
 const SILENCIO_MS = Number(opcion('silencio', 6000)); // sin mensajes nuevos este tiempo = Sandra terminó de contestar
 const MAX_ESPERA_MS = 90000;
+const MAX_TURNOS = 8; // escenarios naturales: mensajes del cliente para llegar al precio
 const NAVEGADOR = args.includes('--navegador');
 const CELULAR = args.includes('--celular');
 const ESPERAR_VENTANA = NAVEGADOR && !args.includes('--sin-esperar') && process.env.PRUEBAS_OCULTO !== '1';
@@ -185,7 +187,34 @@ async function correrEscenario(nombre, escenario, corrida) {
     const saludo = await chat.esperarRespuesta(0);
     saludo.forEach((m) => anotar('sandra', m));
 
-    for (const paso of escenario.pasos) {
+    const revisar = (texto, que, ok) => {
+      revisiones++;
+      console.log(`    ${ok ? verde('✔') : rojo('✘')} ${que}`);
+      revisadas.push({ que, ok });
+      if (!ok) fallas.push(`"${texto}": ${que}`);
+    };
+
+    // Escenario con cliente que contesta lo que Sandra pregunta: responder(ctx) da el siguiente
+    // mensaje (texto o { cliente, revisar }) o { fin: true, revisar } cuando ya terminó.
+    if (escenario.responder) {
+      let terminado = false;
+      let ultimo = '';
+      for (ctx.turno = 0; ctx.turno < MAX_TURNOS; ctx.turno++) {
+        let r = escenario.responder(ctx);
+        if (typeof r === 'string') r = { cliente: r };
+        for (const { que, ok } of r.revisar ?? []) revisar(ultimo, que, ok);
+        if (r.fin) { terminado = true; break; }
+        ultimo = r.cliente;
+        anotar('cliente', ultimo);
+        const turno = await chat.enviar(ultimo);
+        if (!turno.length) { imprimir('sandra', rojo('(sin respuesta)')); conversacion.push({ quien: 'sandra', texto: '(sin respuesta)' }); }
+        turno.forEach((m) => anotar('sandra', m));
+        ctx.ultimoTurno = turno;
+      }
+      if (!terminado) revisar(ultimo, `llega al precio en ${MAX_TURNOS} mensajes o menos`, false);
+    }
+
+    for (const paso of escenario.pasos ?? []) {
       if (paso.soloSi && !paso.soloSi(ctx)) {
         console.log(gris('  (paso omitido: no aplica en esta rama del flujo)'));
         continue;
@@ -241,7 +270,9 @@ async function correrEscenario(nombre, escenario, corrida) {
   let escenarios = ESCENARIOS;
   if (objetivo === 'precios') {
     const { cargarEscenariosPrecios } = require('./escenarios-precios');
-    escenarios = await cargarEscenariosPrecios({ tramite: opcion('tramite'), estado: opcion('estado'), limite: opcion('limite') });
+    escenarios = await cargarEscenariosPrecios({
+      tramite: opcion('tramite'), estado: opcion('estado'), limite: opcion('limite'), directo: args.includes('--directo'),
+    });
     console.log(gris(`${Object.keys(escenarios).length} conversaciones de precios (una por combinación de SIGEV)`));
     if (!Object.keys(escenarios).length) uso('No hay precios con esos filtros');
   }

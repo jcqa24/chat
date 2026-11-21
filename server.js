@@ -42,7 +42,6 @@ const CLIENT_ID_RE = /^[A-Za-z0-9_-]{1,32}$/;
 const LINK_CODE_RE = /^[A-Za-z0-9]{8}$/;
 const INVALID_LINK = 'Este link no es válido o ya no está activo';
 const MESSAGE_SPLIT_RE = /\s*\[SEPARAR\]\s*/i; // separa una respuesta del bot en varios mensajes
-const SPLIT_DELAY_MS = 900;
 const EXTERNAL_REF_RE = /^chat-(\d+)$/; // external_reference que pone el CRM en Mercado Pago
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -174,6 +173,7 @@ async function enviarSaludo(conversation) {
     const msg = await db.insertMessage({
       conversationId: conversation.id, sender: 'influencer', type: 'text', content: GREETING_MESSAGE,
     });
+    marcarUltimoMensaje(conversation.id);
     const now = new Date();
     await db.touchInfluencer(conversation.influencer_id, now);
     io.to(room(conversation.id)).emit('message', msg);
@@ -183,6 +183,32 @@ async function enviarSaludo(conversation) {
   } finally {
     saludosEnCurso.delete(conversation.id);
   }
+}
+
+// Pausa de "escribiendo..." antes de cada mensaje de Sandra (de n8n o del servidor): aleatoria entre
+// 2.5 y 3.5 s, contada desde el último mensaje de la conversación (del cliente o de Sandra). Si la IA ya
+// tardó eso en contestar, el mensaje sale sin esperar más. Los envíos van en fila por conversación.
+const ESCRIBIENDO_MIN_MS = Number(process.env.TYPING_MIN_MS) || 2500;
+const ESCRIBIENDO_MAX_MS = Number(process.env.TYPING_MAX_MS) || 3500;
+const ultimoMensaje = new Map(); // conversationId -> Date.now() del último mensaje
+const colasEnvio = new Map(); // conversationId -> promesa del último envío
+
+const marcarUltimoMensaje = (conversationId) => ultimoMensaje.set(conversationId, Date.now());
+
+async function pausaEscribiendo(conversationId) {
+  const objetivo = ESCRIBIENDO_MIN_MS + Math.random() * (ESCRIBIENDO_MAX_MS - ESCRIBIENDO_MIN_MS);
+  const falta = (ultimoMensaje.get(conversationId) ?? 0) + objetivo - Date.now();
+  if (falta <= 0) return;
+  io.to(room(conversationId)).emit('typing', { typing: true });
+  await new Promise((r) => setTimeout(r, falta));
+}
+
+function enColaEnvio(conversationId, tarea) {
+  const anterior = colasEnvio.get(conversationId) ?? Promise.resolve();
+  const actual = anterior.catch(() => {}).then(tarea);
+  colasEnvio.set(conversationId, actual);
+  actual.finally(() => { if (colasEnvio.get(conversationId) === actual) colasEnvio.delete(conversationId); }).catch(() => {});
+  return actual;
 }
 
 function cancelAutoTyping(conversationId) {
@@ -266,23 +292,24 @@ app.post('/api/messages', requireApiKey, async (req, res) => {
   const invalido = normalizados.find((n) => n.error);
   if (invalido || !normalizados.length) return res.status(400).json({ error: invalido?.error || 'Mensaje vacío' });
 
-  cancelAutoTyping(conversation.id); // si la respuesta llega antes de 1 s, no mostrar "Escribiendo..."
-  const enviados = [];
-  for (const [i, norm] of normalizados.entries()) {
-    if (i > 0) {
-      // Entre mensajes, un instante de "Escribiendo..." para que se lean como dos mensajes seguidos
-      io.to(room(conversation.id)).emit('typing', { typing: true });
-      await new Promise((r) => setTimeout(r, SPLIT_DELAY_MS));
+  cancelAutoTyping(conversation.id);
+  // Cada mensaje (también los separados con [SEPARAR]) sale después de 2.5-3.5 s de "Escribiendo..."
+  const enviados = await enColaEnvio(conversation.id, async () => {
+    const lista = [];
+    for (const norm of normalizados) {
+      await pausaEscribiendo(conversation.id);
+      const msg = await db.insertMessage({
+        conversationId: conversation.id,
+        sender: 'influencer',
+        type,
+        content: norm.content,
+      });
+      marcarUltimoMensaje(conversation.id);
+      io.to(room(conversation.id)).emit('message', msg);
+      lista.push(msg);
     }
-    const msg = await db.insertMessage({
-      conversationId: conversation.id,
-      sender: 'influencer',
-      type,
-      content: norm.content,
-    });
-    io.to(room(conversation.id)).emit('message', msg);
-    enviados.push(msg);
-  }
+    return lista;
+  });
   const now = new Date();
   await db.touchInfluencer(conversation.influencer_id, now);
   io.to(room(conversation.id)).emit('presence', { lastSeen: now.toISOString() });
@@ -431,15 +458,20 @@ const mensajeCodigoTramite = (clave, correo) =>
   `Correo electrónico: ${correo}\nContraseña: ${clave}`;
 
 // Mensaje de la influencer generado por el servidor (no por n8n)
-async function sendInfluencerMessage(conversation, content, { seguirEscribiendo = true } = {}) {
-  const msg = await db.insertMessage({ conversationId: conversation.id, sender: 'influencer', type: 'text', content });
-  const now = new Date();
-  await db.touchInfluencer(conversation.influencer_id, now);
-  io.to(room(conversation.id)).emit('message', msg);
-  io.to(room(conversation.id)).emit('presence', { lastSeen: now.toISOString() });
-  // Si después contesta n8n, Sandra sigue "escribiendo"; si no (flujo del servidor), se apaga
-  io.to(room(conversation.id)).emit('typing', { typing: seguirEscribiendo });
-  return msg;
+// (sale después de 2.5-3.5 s de "Escribiendo...", en fila con los mensajes de n8n)
+function sendInfluencerMessage(conversation, content, { seguirEscribiendo = true } = {}) {
+  return enColaEnvio(conversation.id, async () => {
+    await pausaEscribiendo(conversation.id);
+    const msg = await db.insertMessage({ conversationId: conversation.id, sender: 'influencer', type: 'text', content });
+    marcarUltimoMensaje(conversation.id);
+    const now = new Date();
+    await db.touchInfluencer(conversation.influencer_id, now);
+    io.to(room(conversation.id)).emit('message', msg);
+    io.to(room(conversation.id)).emit('presence', { lastSeen: now.toISOString() });
+    // Si después contesta n8n, Sandra sigue "escribiendo"; si no (flujo del servidor), se apaga
+    io.to(room(conversation.id)).emit('typing', { typing: seguirEscribiendo });
+    return msg;
+  });
 }
 
 // ---------- Flujo de cotización del chat ----------
@@ -458,7 +490,6 @@ async function sendInfluencerMessage(conversation, content, { seguirEscribiendo 
 // Las herramientas de n8n respuesta_cotizacion / generar_cotizacion hacen lo mismo (opcionales).
 
 const ahora = () => new Date().toISOString();
-const esperaMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const MENSAJE_PIDE_DATOS =
   '¡Perfecto! 🙌 Para generar tu trámite necesito tu nombre completo y tu correo electrónico (con ese correo entrarás a la app).';
@@ -519,9 +550,8 @@ function enFila(conversationId, tarea) {
 }
 
 // Mensaje del servidor con "escribiendo..." antes, como si lo escribiera Sandra
-async function escribirComoSandra(conversation, texto, ms = 1200) {
-  io.to(room(conversation.id)).emit('typing', { typing: true });
-  await esperaMs(ms);
+// (la pausa de "escribiendo..." la pone sendInfluencerMessage)
+function escribirComoSandra(conversation, texto) {
   return sendInfluencerMessage(conversation, texto, { seguirEscribiendo: false });
 }
 
@@ -643,7 +673,6 @@ async function enviarPrecotizacion(conversation, cotizacion, { porServidor = fal
     } else {
       await sendInfluencerMessage(conversation, MENSAJE_ASESOR);
     }
-    await esperaMs(SPLIT_DELAY_MS);
     await sendInfluencerMessage(conversation, mensajeCodigoApp(precotizacion.codigo), { seguirEscribiendo: !porServidor });
   }
   return { codigo: precotizacion.codigo, nueva: created };
@@ -1112,6 +1141,7 @@ io.on('connection', async (socket) => {
         type,
         content: norm.content,
       });
+      marcarUltimoMensaje(conversation.id); // la pausa de "escribiendo..." de Sandra se cuenta desde aquí
       io.to(room(conversation.id)).emit('message', msg);
       reply({ ok: true, id: msg.id });
 

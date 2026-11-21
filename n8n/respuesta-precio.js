@@ -30,7 +30,7 @@ const AL_DAR_PRECIO = ' Da el precio UNA sola vez, en un solo mensaje, aclarando
   + ' Termina preguntando: "¿Te gustaría avanzar con eso?".'
   + ' NO digas nada de asesores, códigos, la app ni de los siguientes pasos: cuando el cliente conteste, el sistema se encarga.';
 
-const respuesta = $input.first().json;
+let respuesta = $input.first().json; // puede cambiar: licencias con una sola vigencia se vuelven a consultar
 const { resumen, body, sigevUrl } = $('Traducir a IDs').first().json;
 const token = $('Entrar a SIGEV').first().json.token;
 const conversationId = $('Cuando lo llama el agente').first().json.conversationId;
@@ -87,7 +87,7 @@ const conPrecio = async (precio, servicioClave, extra = '') => {
   return [{ json: {
     encontrado: true, ...resumen, ...precio, servicio: servicioClave,
     diferencias_servicios: DIFERENCIAS, error_registro: errorRegistro ?? undefined,
-    mensaje: `Precio exacto con servicio ${servicioClave}: ${texto(precio)}.${extra} Dáselo al cliente mencionando trámite, estado, vehículo y servicio.` + AL_DAR_PRECIO,
+    mensaje: `Precio exacto con servicio ${servicioClave}: ${texto(precio)}.${extra}${avisoVigencia} Dáselo al cliente mencionando trámite, estado, vehículo y servicio.` + AL_DAR_PRECIO,
   } }];
 };
 
@@ -95,6 +95,134 @@ const conPrecio = async (precio, servicioClave, extra = '') => {
 if (respuesta.statusCode === 401) {
   return [{ json: { encontrado: false, ...resumen,
     mensaje: 'No se pudo entrar a SIGEV. No des ningún precio: dile al cliente que ese dato no lo tienes a la mano y ofrécele pasarlo con un asesor de GEVHE.' } }];
+}
+
+// --- Licencias: las vigencias salen de SIGEV, no de lo que Sandra crea --------
+// Cada estado y vehículo tiene sus vigencias (CDMX auto: solo permanente). Si el cliente no dijo la
+// vigencia o pidió una que no existe, se consulta el catálogo de licencias de SIGEV.
+let avisoVigencia = '';
+if (resumen.esLicencia) {
+  const textoVigencia = (id) => (Number(id) === 99 ? 'permanente' : `${id} ${Number(id) === 1 ? 'año' : 'años'}`);
+  let catalogo = [];
+  try {
+    const cuerpo = await this.helpers.httpRequest({
+      method: 'POST',
+      url: `${sigevUrl}/api/getCatalogoCostosLicencias`,
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      body: {},
+      json: true,
+      timeout: 10000,
+    });
+    catalogo = Array.isArray(cuerpo?.data) ? cuerpo.data : [];
+  } catch (e) {
+    catalogo = []; // sin catálogo: se sigue con lo que respondió getCosto
+  }
+
+  // Estado y/o vehículo sin decir: si con lo que dijo el cliente solo hay una opción en SIGEV, se
+  // completa sola (licencia permanente → CDMX, automóvil); si hay varias, se pregunta solo por esas.
+  if (catalogo.length && (resumen.faltaEstado || resumen.faltaVehiculo)) {
+    const coincide = (f, conVigencia) => Number(f.id_tipotramite) === body.id_tramite
+      && (resumen.faltaEstado || Number(f.id_entidad) === body.id_entidad)
+      && (resumen.faltaVehiculo || Number(f.id_tipovehiculo) === body.id_tipovehiculo)
+      && (!conVigencia || Number(f.id_vigencia) === body.id_vigencia);
+    let opciones = catalogo.filter((f) => coincide(f, resumen.vigenciaIndicada));
+    let sinEsaVigencia = '';
+    if (!opciones.length && resumen.vigenciaIndicada) {
+      sinEsaVigencia = `No hay ${resumen.nombre_tramite} con vigencia ${textoVigencia(body.id_vigencia)}`
+        + `${resumen.faltaEstado ? '' : ` en ${resumen.estado}`}. `;
+      opciones = catalogo.filter((f) => coincide(f, false));
+    }
+    const unicos = (filas, id, nombre) => [...new Map(filas.map((f) => [Number(f[id]), f])).values()]
+      .map((f) => String(f[nombre]));
+    const conVigencia = resumen.vigenciaIndicada && !sinEsaVigencia ? ` ${textoVigencia(body.id_vigencia)}` : '';
+
+    if (opciones.length && resumen.faltaEstado) {
+      const estados = unicos(opciones, 'id_entidad', 'entidad_nombre');
+      if (estados.length > 1) {
+        return [{ json: {
+          encontrado: false, ...resumen, estados_disponibles: estados,
+          mensaje: `${sinEsaVigencia}En SIGEV hay ${resumen.nombre_tramite}${conVigencia} en: ${estados.join(', ')}. `
+            + 'Pregúntale al cliente en cuál de esos estados la necesita (menciona solo esos). No des ningún precio todavía. '
+            + 'Cuando conteste, vuelve a llamar a cotizar_tramite con ese estado.',
+        } }];
+      }
+      const f = opciones[0];
+      body.id_entidad = Number(f.id_entidad);
+      resumen.estado = f.entidad_nombre;
+      resumen.sigev = { ...(resumen.sigev ?? {}), entidad: `${f.id_entidad}-${f.entidad_alias}` };
+      opciones = opciones.filter((x) => Number(x.id_entidad) === body.id_entidad);
+      avisoVigencia += ` Solo existe en ${f.entidad_nombre}: díselo al cliente y no le preguntes el estado.`;
+    }
+    if (opciones.length && resumen.faltaVehiculo) {
+      const vehiculos = unicos(opciones, 'id_tipovehiculo', 'tipovehiculo_nombre').map((v) => v.toLowerCase());
+      if (vehiculos.length > 1) {
+        return [{ json: {
+          encontrado: false, ...resumen, vehiculos_disponibles: vehiculos.join(', '),
+          mensaje: `${sinEsaVigencia}En ${resumen.estado} hay ${resumen.nombre_tramite}${conVigencia} para: ${vehiculos.join(', ')}. `
+            + 'Pregúntale al cliente para cuál la necesita (menciona solo esos). No des ningún precio todavía. '
+            + 'Cuando conteste, vuelve a llamar a cotizar_tramite con ese vehículo y el estado.',
+        } }];
+      }
+      const f = opciones[0];
+      body.id_tipovehiculo = Number(f.id_tipovehiculo);
+      resumen.vehiculo = String(f.tipovehiculo_nombre).toLowerCase();
+      resumen.sigev = { ...(resumen.sigev ?? {}), tipo_vehiculo: `${f.id_tipovehiculo}-${f.tipovehiculo_alias}` };
+      avisoVigencia += ` Solo existe para ${resumen.vehiculo}: díselo al cliente y no le preguntes el tipo de vehículo.`;
+    }
+    respuesta = { statusCode: 0, body: null }; // se consultó sin estado/vehículo: se vuelve a cotizar abajo
+  }
+
+  const delEstado = catalogo.filter((f) => Number(f.id_tipotramite) === body.id_tramite && Number(f.id_entidad) === body.id_entidad);
+  const delVehiculo = delEstado.filter((f) => Number(f.id_tipovehiculo) === body.id_tipovehiculo);
+  const vigencias = [...new Set(delVehiculo.map((f) => Number(f.id_vigencia)))].sort((a, b) => a - b);
+
+  if (catalogo.length && delEstado.length && !delVehiculo.length) {
+    // Hay licencias en ese estado, pero no para ese vehículo
+    const vehiculos = [...new Set(delEstado.map((f) => String(f.tipovehiculo_nombre).toLowerCase()))].join(', ');
+    return [{ json: {
+      encontrado: false, ...resumen, vehiculos_disponibles: vehiculos,
+      mensaje: `En ${resumen.estado} SIGEV no tiene ${resumen.nombre_tramite} para ${resumen.vehiculo}; solo para: ${vehiculos}. Díselo al cliente y pregúntale si le sirve alguno de esos. No des ningún precio todavía.`,
+    } }];
+  }
+
+  if (vigencias.length && !vigencias.includes(body.id_vigencia)) {
+    const pidio = resumen.vigenciaIndicada || resumen.vigenciaPedida
+      ? `No hay vigencia de ${resumen.vigenciaPedida ?? textoVigencia(body.id_vigencia)} para ese estado y vehículo. `
+      : '';
+    if (vigencias.length === 1) {
+      // Una sola vigencia: esa es, se cotiza directo
+      body.id_vigencia = vigencias[0];
+      resumen.vigencia = textoVigencia(vigencias[0]);
+      avisoVigencia += ` ${pidio}La única vigencia disponible en ${resumen.estado} para ${resumen.vehiculo} es ${resumen.vigencia}: menciónala (no ofrezcas otras vigencias).`;
+      try {
+        const cuerpo = await this.helpers.httpRequest({
+          method: 'POST',
+          url: `${sigevUrl}/api/getCosto`,
+          headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+          body,
+          json: true,
+          timeout: 10000,
+        });
+        respuesta = { statusCode: 200, body: cuerpo };
+      } catch (e) {
+        respuesta = { statusCode: e.httpCode ?? 404, body: null };
+      }
+    } else {
+      // Varias: el cliente escoge entre las que existen (con su precio)
+      const opciones = vigencias.map((v) => {
+        const precios = delVehiculo.filter((f) => Number(f.id_vigencia) === v)
+          .map((f) => `${f.tiposervicio_nombre} $${Number(f.costo).toLocaleString('es-MX')}`);
+        return `${textoVigencia(v)}: ${[...new Set(precios)].join(' / ')}`;
+      }).join('; ');
+      return [{ json: {
+        encontrado: false, ...resumen,
+        vigencias_disponibles: vigencias.map(textoVigencia),
+        mensaje: `${pidio}Vigencias disponibles en SIGEV para ${resumen.nombre_tramite} en ${resumen.estado} para ${resumen.vehiculo}: ${opciones}. `
+          + 'Pregúntale al cliente cuál vigencia quiere, mencionando SOLO estas opciones con su precio (no ofrezcas ninguna otra vigencia). '
+          + 'Cuando elija, vuelve a llamar a cotizar_tramite con esa vigencia. Todavía no le preguntes si quiere avanzar.',
+      } }];
+    }
+  }
 }
 
 const pedido = respuesta.statusCode === 200 ? leerPrecio(respuesta.body) : null;
@@ -145,7 +273,7 @@ if (alternativas.length) {
     encontrado: !resumen.servicioIndicado, ...resumen,
     alternativas,
     diferencias_servicios: DIFERENCIAS,
-    mensaje: `${intro} Dale al cliente las opciones de forma breve, con la diferencia entre ellas, y pregúntale cuál prefiere. Cuando elija, vuelve a llamar a cotizar_tramite con ese servicio. Todavía no le preguntes si quiere avanzar.`,
+    mensaje: `${intro}${avisoVigencia} Dale al cliente las opciones de forma breve, con la diferencia entre ellas, y pregúntale cuál prefiere. Cuando elija, vuelve a llamar a cotizar_tramite con ese servicio. Todavía no le preguntes si quiere avanzar.`,
   } }];
 }
 

@@ -146,6 +146,35 @@ async function probarGrupo(g) {
   }
 }
 
+// 2b) Licencias sin decir la vigencia: una sola vigencia → ese precio directo; varias → ofrece
+//     exactamente las que hay en SIGEV (nunca "1, 2, 3 o 4 años" si no existen)
+async function probarLicenciaSinVigencia(filasLic) {
+  const g = filasLic[0];
+  const vigencias = [...new Set(filasLic.map((f) => Number(f.id_vigencia)))].sort((a, b) => a - b);
+  const caso = `${g.tramite_nombre} · ${g.entidad_alias} · ${g.tipovehiculo_alias} · sin vigencia`;
+  const entrada = { tramite: minus(g.tramite_nombre), estado: g.entidad_nombre, vehiculo: minus(g.tipovehiculo_alias), conversationId: 0 };
+  try {
+    const { traducido, respuesta } = await cotizar(entrada);
+    if (!traducido.ok) {
+      registrar({ tipo: 'sin vigencia', caso, esperado: '-', obtenido: '-', ok: false, detalle: `No traduce: ${traducido.mensaje}` });
+      return;
+    }
+    if (vigencias.length === 1) {
+      const costos = [...new Set(filasLic.map((f) => Number(f.costo)))];
+      const esperado = `${vigenciaTexto(vigencias[0])} ${costos.join(' / ')}`;
+      const ok = respuesta.encontrado === true && costos.includes(Number(respuesta.costo)) && respuesta.vigencia === vigenciaTexto(vigencias[0]);
+      registrar({ tipo: 'sin vigencia', caso, esperado, obtenido: `${respuesta.vigencia ?? '-'} ${respuesta.costo ?? '-'}`, ok, detalle: ok ? '' : respuesta.mensaje });
+    } else {
+      const esperado = vigencias.map(vigenciaTexto).join(', ');
+      const obtenido = (respuesta.vigencias_disponibles ?? []).join(', ') || '-';
+      const ok = obtenido === esperado && !respuesta.costo;
+      registrar({ tipo: 'sin vigencia', caso, esperado, obtenido, ok, detalle: ok ? '' : respuesta.mensaje });
+    }
+  } catch (err) {
+    registrar({ tipo: 'sin vigencia', caso, esperado: '-', obtenido: '-', ok: false, detalle: `Error: ${err.message}` });
+  }
+}
+
 // 3) Combinación que NO existe: debe ofrecer asesor, sin inventar precio
 async function probarInexistente(tramite, entidad, vehiculo) {
   const caso = `${tramite.nombre} · ${entidad.alias} · ${vehiculo.alias} (no existe en SIGEV)`;
@@ -158,7 +187,8 @@ async function probarInexistente(tramite, entidad, vehiculo) {
       registrar({ tipo: 'no existe', caso, esperado: 'asesor', obtenido: '-', ok: false, detalle: `No traduce: ${traducido.mensaje}` });
       return;
     }
-    const ok = respuesta.encontrado === false && !respuesta.costo && !(respuesta.alternativas ?? []).length && /asesor/i.test(respuesta.mensaje);
+    const ok = respuesta.encontrado === false && !respuesta.costo && !(respuesta.alternativas ?? []).length
+      && (/asesor/i.test(respuesta.mensaje) || Boolean(respuesta.vehiculos_disponibles));
     registrar({ tipo: 'no existe', caso, esperado: 'asesor, sin precio', obtenido: respuesta.costo ?? (respuesta.alternativas?.length ? 'alternativas' : 'asesor'), ok, detalle: ok ? '' : respuesta.mensaje });
   } catch (err) {
     registrar({ tipo: 'no existe', caso, esperado: 'asesor', obtenido: '-', ok: false, detalle: `Error: ${err.message}` });
@@ -208,6 +238,7 @@ const FRASES = [
   ['emplacar un carro de otro estado', 3], ['alta de placas de un auto de otro estado', 3], ['vehiculo foraneo', 3],
   ['trámite de vehículo de otra entidad', 3], ['alta de placas para vehículo nuevo', 8], ['cambio de propietario de mi carro', 10],
   ['licencia de manejo sin constancia', 44], ['vehículo extranjero', 29],
+  ['licencia permanente', 18], ['licencia de manejo permanente', 18], ['licencia de 3 años', 18],
 ];
 async function probarFrases() {
   for (const [frase, id] of FRASES) {
@@ -267,6 +298,14 @@ async function enParalelo(tareas, n) {
 
   console.log('  Revisando precios...');
   const tareas = grupos.map((g) => () => probarGrupo(g));
+  // Licencias: una prueba sin vigencia por trámite + estado + vehículo
+  const licencias = new Map();
+  for (const f of filas.filter((x) => x.id_vigencia != null)) {
+    const clave = [f.id_tipotramite, f.id_entidad, f.id_tipovehiculo].join('|');
+    if (!licencias.has(clave)) licencias.set(clave, []);
+    licencias.get(clave).push(f);
+  }
+  for (const filasLic of licencias.values()) tareas.push(() => probarLicenciaSinVigencia(filasLic));
   // Una combinación inexistente por trámite: un estado donde ese trámite no tiene precio
   const tramitesConPrecio = [...new Set(filas.map((f) => Number(f.id_tipotramite)))];
   for (const idT of tramitesConPrecio) {
