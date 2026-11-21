@@ -204,6 +204,10 @@ const FRASES = [
   ['licencia', 18], ['licencia de conducir', 18], ['licencia de manejo', 18], ['reposición de licencia', 30],
   ['permiso para circular sin placas', 20], ['baja y alta de placas', 4], ['cambio de propietario', 10],
   ['alta de placas', 7], ['baja de placas', 6], ['verificación', 17], ['reemplacamiento', 5], ['vehículo nuevo', 8],
+  ['vehículo de otra entidad', 3], ['alta de vehículo de otra entidad', 3], ['alta de veiculo de otra entidad', 3],
+  ['emplacar un carro de otro estado', 3], ['alta de placas de un auto de otro estado', 3], ['vehiculo foraneo', 3],
+  ['trámite de vehículo de otra entidad', 3], ['alta de placas para vehículo nuevo', 8], ['cambio de propietario de mi carro', 10],
+  ['licencia de manejo sin constancia', 44], ['vehículo extranjero', 29],
 ];
 async function probarFrases() {
   for (const [frase, id] of FRASES) {

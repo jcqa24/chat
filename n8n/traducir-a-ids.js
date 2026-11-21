@@ -73,6 +73,9 @@ const TRAMITES = {
 // "reimprimir mi tarjeta", "perdí la tarjeta"...). Primero se busca exacto y luego por palabras clave.
 const PALABRAS_RELLENO = /\b(DE|DEL|LA|EL|LOS|LAS|MI|SU|UNA|UN|PARA|CIRCULACION|VEHICULAR|TRAMITE)\b/g;
 const REGLAS_TRAMITE = [
+  [/OTRA ENTIDAD/, /./, 3], // "alta de vehículo de otra entidad", "placas de otra entidad"
+  [/EXTRANJER/, /./, 29],
+  [/NUEV[OA]/, /PLACA|ALTA|EMPLAC|VEHICULO|AUTO|CARRO|MOTO/, 8], // "alta de placas para vehículo nuevo"
   [/REIMPR/, /TARJETA/, 40],
   [/REPOSIC|PERDI|EXTRAVI|ROBAR|ROBO/, /TARJETA/, 11],
   [/RENOV|VENCID|ACTUALIZ/, /TARJETA/, 9],
@@ -81,15 +84,32 @@ const REGLAS_TRAMITE = [
   [/BAJA/, /ALTA/, 4],
   [/CAMBIO/, /PROPIETARI|DUENO|NOMBRE/, 10],
 ];
+// Errores de dedo y formas comunes que se corrigen antes de buscar
+const CORRECCIONES = [
+  [/\b(VEICULO|BEHICULO|VEHICLO|VEHICUO|VEHIULO)S?\b/g, 'VEHICULO'],
+  [/\b(CARRO|COCHE|AUTO|AUTOMOVIL|MOTO|CAMIONETA|VEHICULO)S? (DE|DEL|EN|DE UN) OTRO ESTADO\b/g, 'VEHICULO DE OTRA ENTIDAD'],
+  [/\bDE OTRO ESTADO\b/g, 'DE OTRA ENTIDAD'],
+  [/\b(PLACAS|AUTO|CARRO|VEHICULO) FORANE[OA]S?\b/g, 'VEHICULO DE OTRA ENTIDAD'],
+];
+const corregir = (v) => CORRECCIONES.reduce((t, [re, por]) => t.replace(re, por), v);
+
+// Nombres de 2 palabras o más, del más largo al más corto: para encontrarlos DENTRO de una frase
+// ("alta de vehículo de otra entidad" contiene "vehículo de otra entidad")
+const NOMBRES_LARGOS = Object.keys(TRAMITES).filter((k) => k.includes(' ')).sort((a, b) => b.length - a.length);
+const contienePalabras = (texto, nombre) => ` ${texto} `.includes(` ${nombre} `);
+
 const buscarTramite = (valor) => {
-  const v = norm(valor);
+  const v = corregir(norm(valor));
   if (!v) return null;
   if (TRAMITES[v]) return TRAMITES[v];
   const corto = v.replace(PALABRAS_RELLENO, ' ').replace(/\s+/g, ' ').trim();
   if (TRAMITES[corto]) return TRAMITES[corto];
   for (const [a, b, id] of REGLAS_TRAMITE) if (a.test(v) && b.test(v)) return id;
   const conDe = Object.keys(TRAMITES).find((k) => k.length > 5 && norm(k.replace(/ DE /g, ' ')) === corto);
-  return conDe ? TRAMITES[conDe] : null;
+  if (conDe) return TRAMITES[conDe];
+  // El nombre de un trámite dentro de la frase (gana el más largo)
+  const dentro = NOMBRES_LARGOS.find((k) => contienePalabras(v, k) || contienePalabras(corto, norm(k.replace(/ DE /g, ' '))));
+  return dentro ? TRAMITES[dentro] : null;
 };
 // Nombre oficial de cada trámite (cat_tramite.tramite_nombre en SIGEV): se guarda en la precotización.
 const NOMBRE_OFICIAL = {
@@ -228,7 +248,10 @@ if (faltan.length) {
     ok: false,
     encontrado: false,
     ...resumen,
-    mensaje: `No puedo cotizar todavía. Falta o no es válido: ${faltan.join('; ')}. Pregúntale al cliente solo el primer dato que falta. No des ningún precio.`,
+    mensaje: idTramite
+      ? `No puedo cotizar todavía. Falta o no es válido: ${faltan.join('; ')}. Pregúntale al cliente solo el primer dato que falta. No des ningún precio.`
+      // Trámite no reconocido: que reintente con el nombre oficial, nunca con otro trámite "parecido"
+      : `No reconozco el trámite "${entrada.tramite ?? ''}". Vuelve a llamar a cotizar_tramite con el nombre oficial que corresponda a lo que pidió el cliente, exactamente como aparece en esta lista: ${NOMBRES_TRAMITE}. NO uses otro trámite distinto ni parecido (por ejemplo, "vehículo de otra entidad" NO es "alta de placas"). Si ninguno corresponde, pregúntale al cliente qué trámite necesita. No digas que no tienes el dato y no des ningún precio.`,
   } }];
 }
 
