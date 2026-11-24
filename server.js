@@ -21,10 +21,6 @@ const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET || '';
 // CRM (leadsgg): ahí se crea el lead cuando el cliente acepta continuar el trámite
 const CRM_URL = (process.env.CRM_URL || '').replace(/\/+$/, '');
 const CRM_API_TOKEN = process.env.CRM_API_TOKEN || '';
-// SIGEV: usuario (que también es socio) con el que el chat genera las cotizaciones de costo fijo
-const SIGEV_URL = (process.env.SIGEV_URL || 'https://my.grupogevhe.com').replace(/\/+$/, '');
-const SIGEV_EMAIL = process.env.SIGEV_EMAIL || '';
-const SIGEV_PASSWORD = process.env.SIGEV_PASSWORD || '';
 const APP_ANDROID_URL = process.env.APP_ANDROID_URL || 'https://play.google.com/store/apps/details?id=com.grupogevhe.app&hl=es_MX';
 const APP_IOS_URL = process.env.APP_IOS_URL || 'https://apps.apple.com/mx/app/gevhe-app/id6759180407';
 // Primer mensaje de la influencer en cada conversación nueva. GREETING_MESSAGE=off lo desactiva.
@@ -451,11 +447,6 @@ const mensajeCodigoApp = (codigo) =>
   `El código de tu precotización es [copiar]${codigo}[/copiar] puedes usarlo en la app para darle seguimiento a tu precotización. ` +
   `Puedes descargar la app desde los siguientes links:\n${LINKS_APP}`;
 const MENSAJE_ASESOR = 'Un asesor se contactará contigo por medio de nuestra app 🙌';
-const mensajeCodigoTramite = (clave, correo) =>
-  `El código de tu trámite es [copiar]${clave}[/copiar] guárdalo bien, será tu contraseña 🔐\n` +
-  `Para continuar descarga la app desde los siguientes links:\n${LINKS_APP}\n` +
-  'En la pantalla de login ingresa tu correo (el que me diste) y en contraseña el código de tu trámite. Ejemplo:\n' +
-  `Correo electrónico: ${correo}\nContraseña: ${clave}`;
 
 // Mensaje de la influencer generado por el servidor (no por n8n)
 // (sale después de 2.5-3.5 s de "Escribiendo...", en fila con los mensajes de n8n)
@@ -475,7 +466,7 @@ function sendInfluencerMessage(conversation, content, { seguirEscribiendo = true
 }
 
 // ---------- Flujo de cotización del chat ----------
-// El servidor lleva el paso de cada conversación en ultima_cotizacion.estado:
+// El servidor lleva el paso de cada conversación en ultima_cotizacion.paso ("estado" es el de la república):
 //   esperando_respuesta → Sandra dio un precio y preguntó "¿Te gustaría avanzar con eso?"
 //   esperando_datos     → aceptó un trámite de costo fijo: faltan nombre y correo
 //   terminada           → ya se respondió (rechazó, recibió su PRE o su código de trámite)
@@ -486,13 +477,14 @@ function sendInfluencerMessage(conversation, content, { seguirEscribiendo = true
 //    o el nombre y el correo, los resuelve el servidor sin pasar por la IA. Lo demás va a Sandra.
 //    - No: su lead regresa a la primera columna de Comercial.
 //    - Sí, sin costo fijo (más impuestos): precotización PRE + "un asesor te contactará".
-//    - Sí, con costo fijo: se piden nombre y correo; con ellos se crea la cotización en SIGEV (COTA…).
+//    - Sí, con costo fijo: se piden nombre y correo (se guardan en el lead) y el cliente recibe su
+//      precotización PRE… con los links de la app. No se crea nada en SIGEV.
 // Las herramientas de n8n respuesta_cotizacion / generar_cotizacion hacen lo mismo (opcionales).
 
 const ahora = () => new Date().toISOString();
 
 const MENSAJE_PIDE_DATOS =
-  '¡Perfecto! 🙌 Para generar tu trámite necesito tu nombre completo y tu correo electrónico (con ese correo entrarás a la app).';
+  '¡Perfecto! 🙌 Para generar tu precotización necesito tu nombre completo y tu correo electrónico (con ese correo entrarás a la app).';
 const MENSAJE_PIDE_NOMBRE = '¡Gracias! ¿Y tu nombre completo?';
 const mensajePideCorreo = (nombre) =>
   `¡Gracias, ${nombre.split(' ')[0]}! ¿Me compartes tu correo electrónico? Con él entrarás a la app 📲`;
@@ -506,7 +498,7 @@ app.post('/api/conversations/:conversationId/cotizacion', requireApiKey, async (
   if (datos.error) return res.status(400).json({ error: datos.error });
   // Costo fijo = SIGEV no le suma impuestos (mas_impuestos = 0)
   const cotizacion = {
-    ...datos, costoFijo: !datos.masImpuestos, aceptada: null, estado: 'esperando_respuesta', cotizadaAt: ahora(),
+    ...datos, costoFijo: !datos.masImpuestos, aceptada: null, paso: 'esperando_respuesta', cotizadaAt: ahora(),
   };
   await db.setUltimaCotizacion(conversation.id, cotizacion);
   res.json({ ok: true, costo_fijo: cotizacion.costoFijo, cotizacion });
@@ -567,7 +559,7 @@ async function responderCotizacion(conversation, acepta, { porServidor }) {
   }
 
   if (!acepta) {
-    await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: false, estado: 'terminada', respondidaAt: ahora() });
+    await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: false, paso: 'terminada', respondidaAt: ahora() });
     const crm = await actualizarLeadEnCrm(conv, { primera_columna: true });
     if (porServidor) await escribirComoSandra(conv, MENSAJE_RECHAZO);
     return {
@@ -577,10 +569,10 @@ async function responderCotizacion(conversation, acepta, { porServidor }) {
   }
 
   if (cotizacion.costoFijo) {
-    if (cotizacion.claveCotizacion) {
-      return { ok: true, acepta, costo_fijo: true, mensaje: `El cliente ya tiene su código (${cotizacion.claveCotizacion}). NO lo repitas: responde solo a lo último que dijo.` };
+    if (cotizacion.codigoPre) {
+      return { ok: true, acepta, costo_fijo: true, mensaje: `El cliente ya tiene su código de precotización (${cotizacion.codigoPre}). NO lo repitas: responde solo a lo último que dijo.` };
     }
-    await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: true, estado: 'esperando_datos', respondidaAt: ahora() });
+    await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: true, paso: 'esperando_datos', respondidaAt: ahora() });
     if (porServidor) await escribirComoSandra(conv, MENSAJE_PIDE_DATOS);
     return {
       ok: true, acepta, costo_fijo: true,
@@ -588,7 +580,7 @@ async function responderCotizacion(conversation, acepta, { porServidor }) {
     };
   }
 
-  await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: true, estado: 'terminada', respondidaAt: ahora() });
+  await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: true, paso: 'terminada', respondidaAt: ahora() });
   const { codigo, nueva } = await enviarPrecotizacion(conv, cotizacion, { porServidor });
   return {
     ok: true, acepta, costo_fijo: false, codigo, nueva,
@@ -600,7 +592,7 @@ async function responderCotizacion(conversation, acepta, { porServidor }) {
 
 const CORREO_VALIDO_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
-/** Con nombre y correo (costo fijo): crea la cotización en SIGEV y le manda al cliente su código. */
+/** Con nombre y correo (costo fijo): actualiza el lead y le manda al cliente su código de precotización PRE. */
 async function generarCotizacion(conversation, nombre, correo, { porServidor }) {
   if (nombre.length < 2 || nombre.length > 100) return { ok: false, mensaje: 'Falta el nombre completo del cliente: pídeselo.' };
   if (correo.length > 150 || !CORREO_VALIDO_RE.test(correo)) {
@@ -618,49 +610,30 @@ async function generarCotizacion(conversation, nombre, correo, { porServidor }) 
   if (cotizacion.aceptada === false) {
     return { ok: false, mensaje: 'El cliente había dicho que no quería avanzar. Confírmale si ahora sí quiere y llama a respuesta_cotizacion con acepta true.' };
   }
-  if (cotizacion.claveCotizacion) {
+  if (cotizacion.codigoPre) {
     return {
-      ok: true, clave: cotizacion.claveCotizacion, nueva: false,
-      mensaje: `El cliente ya tiene su código (${cotizacion.claveCotizacion}) y las instrucciones de la app. NO los repitas: responde solo a lo último que dijo.`,
+      ok: true, codigo: cotizacion.codigoPre, nueva: false,
+      mensaje: `El cliente ya tiene su código de precotización (${cotizacion.codigoPre}) y los links de la app. NO los repitas: responde solo a lo último que dijo.`,
     };
   }
 
   // Dar nombre y correo ya es aceptar la cotización (por si el agente se saltó respuesta_cotizacion)
   await db.setUltimaCotizacion(conv.id, {
-    ...cotizacion, aceptada: true, estado: 'esperando_datos', nombre, correo, respondidaAt: cotizacion.respondidaAt ?? ahora(),
+    ...cotizacion, aceptada: true, paso: 'esperando_datos', nombre, correo, respondidaAt: cotizacion.respondidaAt ?? ahora(),
   });
   await db.setLeadDatos(conv.id, nombre, correo);
   const crm = await actualizarLeadEnCrm({ ...conv, lead_name: nombre }, { nombre, correo });
 
-  if (porServidor) io.to(room(conv.id)).emit('typing', { typing: true }); // SIGEV tarda unos segundos
-  let clave = null;
-  let errorSigev = null;
-  try {
-    clave = await crearCotizacionSigev(cotizacion, nombre, correo);
-  } catch (err) {
-    errorSigev = err.message;
-    console.error(`SIGEV: no se generó la cotización de la conversación ${conv.id}: ${err.message}`);
-  }
-
-  if (!clave) {
-    // Sin SIGEV no hay código para la app: sigue como precotización y lo atiende un asesor
-    await db.setUltimaCotizacion(conv.id, { ...cotizacion, aceptada: true, estado: 'terminada', nombre, correo, errorSigev });
-    const { codigo } = await enviarPrecotizacion(conv, cotizacion, { porServidor });
-    return {
-      ok: true, sigev: false, error_sigev: errorSigev, codigo, crm,
-      mensaje: `No se pudo generar el trámite; el cliente YA recibió que un asesor lo contactará por la app y su código de precotización (${codigo}). NO repitas el código ni los links. Responde solo una frase corta de cierre.`,
-    };
-  }
-
+  // Costo fijo: con nombre y correo se genera la precotización PRE… (no se crea nada en SIGEV)
+  const { precotizacion, created } = await db.createPrecotizacion(conv, cotizacion);
   await db.setUltimaCotizacion(conv.id, {
-    ...cotizacion, aceptada: true, estado: 'terminada', claveCotizacion: clave, nombre, correo, generadaAt: ahora(),
+    ...cotizacion, aceptada: true, paso: 'terminada', nombre, correo, codigoPre: precotizacion.codigo, generadaAt: ahora(),
   });
-  const { precotizacion } = await db.createPrecotizacion(conv, { ...cotizacion, claveCotizacion: clave });
-  await sendInfluencerMessage(conv, mensajeCodigoTramite(clave, correo), { seguirEscribiendo: !porServidor });
+  if (created) await sendInfluencerMessage(conv, mensajeCodigoApp(precotizacion.codigo), { seguirEscribiendo: !porServidor });
 
   return {
-    ok: true, sigev: true, clave, codigo: precotizacion.codigo, crm,
-    mensaje: `El cliente YA recibió en un mensaje aparte el código de su trámite (${clave}), los links de la app y cómo iniciar sesión. NO repitas el código, los links ni las instrucciones. Responde solo una frase corta de cierre, por ejemplo: "¡Listo! Cualquier duda aquí estoy 😊".`,
+    ok: true, codigo: precotizacion.codigo, nueva: created, crm,
+    mensaje: `El cliente YA recibió en un mensaje aparte su código de precotización (${precotizacion.codigo}) y los links de la app. NO repitas el código ni los links. Responde solo una frase corta de cierre, por ejemplo: "¡Listo! Cualquier duda aquí estoy 😊".`,
   };
 }
 
@@ -744,14 +717,14 @@ async function manejarFlujo(conversationId, texto) {
   const cotizacion = conv && db.getUltimaCotizacion(conv);
   if (!cotizacion) return false;
 
-  if (cotizacion.estado === 'esperando_respuesta') {
+  if (cotizacion.paso === 'esperando_respuesta') {
     const respuesta = clasificarRespuesta(texto);
     if (!respuesta) return false;
     await responderCotizacion(conv, respuesta === 'si', { porServidor: true });
     return true;
   }
 
-  if (cotizacion.estado === 'esperando_datos') {
+  if (cotizacion.paso === 'esperando_datos') {
     const encontrado = extraerDatos(texto);
     const nombre = encontrado.nombre ?? cotizacion.nombre ?? null;
     const correo = encontrado.correo ?? cotizacion.correo ?? null;
@@ -767,66 +740,6 @@ async function manejarFlujo(conversationId, texto) {
   }
 
   return false;
-}
-
-// ---------- SIGEV ----------
-async function sigevPost(ruta, body, token) {
-  const resp = await fetch(`${SIGEV_URL}${ruta}`, {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(15000),
-  });
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok || data.success === false || data.status === 'error') {
-    const detalle = data.error || data.message || (data.errors && JSON.stringify(data.errors)) || 'sin detalle';
-    throw new Error(`${ruta} → HTTP ${resp.status}: ${detalle}`);
-  }
-  return data;
-}
-
-// "Juan Carlos Pérez López" → nombre "Juan Carlos", apellidos "Pérez López"
-function separarNombre(completo) {
-  const partes = completo.split(' ');
-  if (partes.length === 1) return { nombre: completo, apellidos: '' };
-  const nApellidos = partes.length >= 3 ? 2 : 1;
-  return { nombre: partes.slice(0, -nApellidos).join(' '), apellidos: partes.slice(-nApellidos).join(' ') };
-}
-
-// Crea la cotización en SIGEV a nombre del cliente y devuelve su clave (COTA…).
-// El cliente entra a la app con su correo y esa clave; el trámite A se genera en la app al pagar el anticipo.
-async function crearCotizacionSigev(cotizacion, nombreCompleto, correo) {
-  if (!SIGEV_EMAIL || !SIGEV_PASSWORD) throw new Error('SIGEV_EMAIL o SIGEV_PASSWORD sin configurar');
-  const s = cotizacion.sigev || {};
-  const faltan = ['tipo_tramite', 'tipo_vehiculo', 'entidad', 'tipo_servicio'].filter((c) => !s[c]);
-  if (faltan.length) throw new Error(`faltan datos para SIGEV (${faltan.join(', ')}): actualiza el código de n8n`);
-
-  const { token } = await sigevPost('/api/login', { email: SIGEV_EMAIL, password: SIGEV_PASSWORD });
-  if (!token) throw new Error('SIGEV no devolvió token');
-
-  const creada = await sigevPost(
-    '/api/cotizacion/createCotizacionExpres',
-    { ...s, email: correo, subtotal: cotizacion.costo ?? 0, descuento: 0 },
-    token
-  );
-  if (!creada.clave) throw new Error('SIGEV no devolvió la clave de la cotización');
-
-  // La cotización exprés se crea a nombre de "DATOS PENDIENTES": se le pone el nombre real del cliente
-  const { nombre, apellidos } = separarNombre(nombreCompleto);
-  try {
-    await sigevPost(
-      '/api/cotizacion/actualizar',
-      { datos_completos: 0, clave: creada.clave, nombre, apellidos, email: correo },
-      token
-    );
-  } catch (err) {
-    console.error(`SIGEV: la cotización ${creada.clave} se creó, pero no se le pudo poner el nombre: ${err.message}`);
-  }
-  return creada.clave;
 }
 
 app.get('/api/conversations/:conversationId/precotizaciones', requireApiKey, async (req, res) => {

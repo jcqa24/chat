@@ -584,11 +584,20 @@ async function setUltimaCotizacion(conversationId, cotizacion) {
 
 function getUltimaCotizacion(conversation) {
   if (!conversation?.ultima_cotizacion) return null;
+  let c;
   try {
-    return JSON.parse(conversation.ultima_cotizacion);
+    c = JSON.parse(conversation.ultima_cotizacion);
   } catch {
     return null;
   }
+  // Antes el paso del flujo se guardaba en "estado" y pisaba el estado de la república:
+  // se pasa a "paso" (el estado de la república de esas cotizaciones ya se perdió)
+  const PASOS = ['esperando_respuesta', 'esperando_datos', 'terminada'];
+  if (!c.paso && PASOS.includes(c.estado)) {
+    c.paso = c.estado;
+    c.estado = null;
+  }
+  return c;
 }
 
 // ---------- Precotizaciones ----------
